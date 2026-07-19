@@ -1,0 +1,46 @@
+name: Slack on failure
+
+# Optional: pings Slack only when a CI run ends in failure. It no-ops unless the
+# repo has a SLACK_WEBHOOK_URL secret, so a fork inherits nothing.
+# (workflow_run + if(conclusion == failure) scopes it to failures only.)
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    # The empty-SLACK_WEBHOOK_URL check in the step below prevents forks from
+    # firing even if they happen to set the secret.
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          WF: ${{ github.event.workflow_run.name }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TITLE: ${{ github.event.workflow_run.display_title }}
+          ACTOR: ${{ github.event.workflow_run.actor.login }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_NO: ${{ github.event.workflow_run.run_number }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not set; skipping"; exit 0
+          fi
+          # branch/title/actor are attacker-controlled on a fork PR: escape
+          # Slack's control characters so a crafted branch name can't inject
+          # <!channel> mentions or disguised <url|label> links.
+          payload=$(jq -n \
+            --arg repo "$REPO" --arg wf "$WF" --arg branch "$BRANCH" \
+            --arg title "$TITLE" --arg actor "$ACTOR" --arg url "$RUN_URL" --arg no "$RUN_NO" \
+            'def esc: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
+             {text: ":red_circle: *Run failed* — `\($repo)` (\($branch|esc)) / \($wf) #\($no)\n\($title|esc)\n<\($url)|View run> · @\($actor|esc)"}')
+          # -f so a non-2xx Slack response (revoked/invalid webhook, 429) makes
+          # curl exit non-zero and fails this step. Without it curl exits 0 on
+          # any HTTP status and a delivery failure would pass silently.
+          curl -sSf -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"

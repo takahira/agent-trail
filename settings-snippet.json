@@ -1,0 +1,87 @@
+{
+  "_comment": [
+    "Wire hook.py into Claude Code by merging this hooks block into",
+    "~/.claude/settings.json (global) or .claude/settings.json (per project).",
+    "Replace /ABSOLUTE/PATH/TO/hook.py with the real absolute path to hook.py",
+    "in your clone of this repo.",
+    "",
+    "The SAME hook.py handles every event kind (it dispatches on hook_event_name):",
+    "  PreToolUse / PostToolUse / PostToolUseFailure : before/after snapshot",
+    "    (matcher limits the tools). PostToolUseFailure fires when a tool FAILS; wiring",
+    "    it is strongly recommended -- without it, a failed command's partial writes",
+    "    are not captured. Omit this block if your Claude Code version predates it.",
+    "    single-file tools: Write / Edit / Read / NotebookEdit / MultiEdit",
+    "    command tool:      Bash",
+    "  UserPromptSubmit : record the user's prompt (redacted; no matcher needed)",
+    "  Stop / SubagentStop : record per-turn token usage from the transcript",
+    "",
+    "UserPromptSubmit / Stop carry no tool_name, so they take no matcher.",
+    "Set ALOG_DATA to change the store location (default: <cwd>/.alog).",
+    "Set ALOG_DEBUG=1 to print the hook's internal log to stderr."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|Read|NotebookEdit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|Read|NotebookEdit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash|Write|Edit|Read|NotebookEdit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}

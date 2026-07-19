@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }}, py ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # 3.9 is the conservative floor the code targets (`from __future__ import
+      # annotations` keeps `X | None` hints safe there); 3.14 is the current
+      # release. The macOS slot verifies the POSIX-FS + flock paths on that OS.
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.9", "3.14"]
+        include:
+          - os: macos-latest
+            python: "3.14"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      # Zero third-party dependencies; discover tests from the repo root so the
+      # loader in tests/ finds alog.py / hook.py one level up.
+      - name: unit tests (unittest)
+        run: python3 -m unittest discover -s tests -p "test_*.py" -t .
+      # Integration: feed synthesized hook payloads into the real hook.py around
+      # real filesystem ops in a throwaway /tmp repo, then assert the audit log.
+      - name: integration demo (demo.sh)
+        run: bash demo.sh

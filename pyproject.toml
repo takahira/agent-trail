@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-trail"
+description = "Local, offline audit log for AI coding agents: reconstruct opaque Bash effects, secret reads, prompts, and token cost that git diff cannot show"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Takayoshi Hirano" }]
+keywords = [
+    "claude",
+    "claude-code",
+    "hook",
+    "audit",
+    "audit-log",
+    "agent",
+    "observability",
+    "security",
+    "secrets",
+    "diff",
+    "tokens",
+    "cost",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Security",
+    "Topic :: Utilities",
+]
+# Zero runtime dependencies on purpose: standard library only (Python 3.9+).
+dependencies = []
+dynamic = ["version"]
+
+[project.scripts]
+alog = "alog:main"
+
+[project.urls]
+Homepage = "https://github.com/takahira/agent-trail"
+Repository = "https://github.com/takahira/agent-trail"
+Issues = "https://github.com/takahira/agent-trail/issues"
+
+# Single source of truth for the version: alog.py __version__.
+[tool.hatch.version]
+path = "alog.py"
+
+# The wheel ships ONLY alog.py (the `alog` CLI). hook.py is deliberately excluded:
+# it is wired into settings.json by ABSOLUTE PATH to a clone, never imported, and
+# shipping a top-level module literally named `hook` in a shared/site venv is a
+# namespace-collision hazard. `pip install` gets the reader; the hook comes from the
+# git clone (see README).
+[tool.hatch.build.targets.wheel]
+only-include = ["alog.py"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "alog.py",
+    "hook.py",
+    "demo.sh",
+    "tests/",
+    "settings-snippet.json",
+    "README.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+]

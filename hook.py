@@ -1,0 +1,2192 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Agent audit-log capture hook.
+
+A single hook that Claude Code (and other agents with a Pre/PostToolUse hook
+contract) calls *around* every tool invocation. It reads the hook payload on
+stdin and records what the agent touched into a local, content-addressed audit
+log -- with zero cloud dependency.
+
+Why a hook instead of `git diff` after the fact?
+------------------------------------------------
+`git diff` answers "which *tracked* files changed", but an audit of an AI agent
+needs three things git cannot give you from the working tree:
+
+1. **What a Bash command actually changed.** The command *string* (`sed -i ...`,
+   `rm ...`, a script that writes files) does not tell you which files moved.
+   We snapshot the work tree's content hashes immediately *before* and *after*
+   the command, so the change is reconstructed from observed state.
+2. **Files the agent only READ.** Reading `.env` leaves no trace in git. We log
+   the access, so a read of a secret is visible even though nothing changed.
+3. **A faithful before/after even for untracked / .gitignore'd files.**
+
+Secret-safety of the store itself (this is an audit tool, not a leak)
+---------------------------------------------------------------------
+Two levels of guarantee -- one hard, one best-effort. Secret DETECTION is heuristic
+(no regex proves arbitrary content secret-free), so the promise is precise:
+- HARD: a DETECTED secret's cleartext is never stored. A file matched by
+  ``is_sensitive`` (name) OR the content sniff (whole-body credential shapes) is
+  recorded as a *salted* digest only; its bytes are never written to the object
+  store (and the salted digest is not a sha256(content) oracle).
+- BEST-EFFORT: an UNDETECTED secret can be stored. A value in an unusual shape, a
+  novel vendor prefix, or a secret embedded in a filename/path/symlink target can
+  land in the object store or NDJSON log as part of otherwise-innocuous content.
+- DEFENSE-IN-DEPTH backstops that: the whole store is created 0700 with 0600
+  objects, and an ``.alog/.gitignore`` (``*``) is dropped in so it can't be
+  committed or read by other local users. Treat ``.alog/`` as sensitive.
+- Stored Bash command strings / prompts are passed through ``redact_command`` /
+  ``redact_prompt`` to mask inline tokens (best-effort).
+
+Event model
+-----------
+PreToolUse       -> snapshot "before" digests of the files of interest; push onto
+                    a per-session pending stack.
+PostToolUse      -> snapshot "after" digests, pop the matching "before" (matched
+                    by tool AND file_path for single-file tools), and write ONE
+                    consolidated NDJSON event. A Post with no matching Pre
+                    degrades to "before unknown" rather than fabricating changes.
+UserPromptSubmit -> write a ``kind:"prompt"`` event with the (redacted) prompt --
+                    what the agent was ASKED, which git never sees.
+Stop/SubagentStop-> read the session transcript and write one ``kind:"turn"``
+                    event per new assistant message with its token usage + model.
+                    Cost is NOT stored (alog derives it from the tokens), and
+                    turns are deduped by message.id so a repeated Stop over a
+                    growing transcript never double-counts.
+
+All events share one per-session NDJSON file and a monotonic ``seq``; the tool
+events carry no ``kind`` (implicitly "tool") so the reader stays backward-compat.
+
+Python 3.9 compatible; standard library only. Never raises into the agent.
+
+Structure note: this is intentionally ONE self-contained file. Claude Code wires
+the hook by an absolute path to this single script (see settings-snippet.json), so
+it is deliberately NOT split into an importable package -- that keeps the "point
+your settings at one file" install trivial and the audit guarantees reviewable in
+one place. This is a conscious exception to the usual file-size guidance; if
+distribution ever moves to a package, the natural split is by concern (secrets /
+store / worktree / session log / events / transcript).
+"""
+from __future__ import annotations
+
+import contextlib
+import errno
+import fcntl
+import fnmatch
+import hashlib
+import json
+import math
+import os
+import re
+import stat
+import sys
+import time
+from typing import Dict, List, Optional, Set, Tuple
+
+# ---- configuration -------------------------------------------------------
+
+SINGLE_FILE_TOOLS = {"Write", "Edit", "Read", "NotebookEdit", "MultiEdit"}
+# Read is single-file but READ-ONLY: it can never author a change, so a concurrent
+# Read overlapping a Bash command must not be credited with the command's write
+# (attribution=claimed_by_concurrent) -- that would disown the Bash command's real
+# modification and pin it on a tool that cannot write. Only these tools can author
+# a change and thus legitimately "claim" a path from a concurrent Bash.
+READ_ONLY_TOOLS = {"Read"}
+WRITE_TOOLS = SINGLE_FILE_TOOLS - READ_ONLY_TOOLS
+
+# Directories the WHOLE-TREE Bash snapshot never descends (for speed, and to avoid
+# hashing build noise). KNOWN LIMITATION / NON-GOAL: a change a Bash command makes
+# to a file UNDER one of these dirs (e.g. `.git/hooks/pre-commit`, `dist/bundle.js`)
+# is therefore not reconstructed from the tree diff -- though the Bash COMMAND STRING
+# is still captured and secret-scanned. A single-file Write/Edit tool targeting the
+# same path IS recorded (it snapshots the named path directly, bypassing this skip).
+# This blind spot is documented in the README security posture, not silently assumed.
+TREE_SKIP_DIRS = {".git", ".alog", "node_modules", ".venv", "venv",
+                  "__pycache__", ".mypy_cache", ".pytest_cache", "dist",
+                  "build", ".next", "target"}
+
+MAX_BLOB_BYTES = 10 * 1024 * 1024
+
+# Sensitive-file matching. Bias: PRECISE (few false positives) over exhaustive.
+# Detection here is non-blocking -- a missed file is still logged as an access
+# when read via the Read tool; the point is the secret-content-at-rest guard and
+# the "read of a secret" headline, not a perfect classifier.
+SENSITIVE_EXACT_NAMES = {
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    "credentials", ".npmrc", ".netrc", ".pgpass", ".htpasswd",
+    "kubeconfig", ".dockercfg", ".pypirc",
+    "terraform.tfstate", "terraform.tfstate.backup",
+    ".dev.vars", ".git-credentials",  # Wrangler/CF local secrets; git stored creds
+    "secret", "secrets", ".secret", ".secrets",  # bare, no extension (glob needs a dot)
+    ".vault-token", ".envrc",         # Vault CLI token; direnv (often `export SECRET=`)
+}
+SENSITIVE_GLOBS = [
+    ".env", ".env.*", "*.env",
+    "*.pem", "*.key", "*.p12", "*.pfx", "*.ppk", "*.keystore", "*.jks",
+    "*.tfstate", "*.kubeconfig",
+    "*.tfvars", "*.tfvars.json",      # Terraform var files often hold secrets
+    ".dev.vars", ".dev.vars.*",       # Wrangler/Cloudflare local secret bindings
+    "*.ovpn", "*.enc",
+    "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
+    "credentials*.json", "*-credentials.json", "*_credentials.json",
+    "*service-account*.json", "*serviceaccount*.json", "*service_account*.json",
+    "secret.*", "secrets.*", "*.secret",
+]
+# Exact path SEGMENTS (never substring-of-whole-path -- that false-flags e.g.
+# "wisshful.txt" for ".ssh"). A path is sensitive if any of these is a full dir
+# component. Two tiers by ambiguity:
+#   ABS: unambiguous config dot-dirs, checked against the ABSOLUTE path so an agent
+#        running UNDER ~/.ssh (display path just "config") is still classified. These
+#        names essentially never occur as an ordinary project ancestor.
+#   REL: generic nouns, checked only against the cwd-RELATIVE path -- a repo merely
+#        CLONED under ~/projects/secrets/ or ~/code/gcloud/ must NOT have every file
+#        wholesale-withheld (which would make `alog diff` useless for the project).
+SENSITIVE_DIR_SEGMENTS_ABS = {".ssh", ".aws", ".gnupg", ".kube", ".docker"}
+SENSITIVE_DIR_SEGMENTS_REL = {"gcloud", "secrets"}
+SENSITIVE_PATH_SEGMENTS = SENSITIVE_DIR_SEGMENTS_ABS | SENSITIVE_DIR_SEGMENTS_REL
+# Allowlist, checked FIRST: public / template artifacts are NEVER secret. This
+# both removes audit noise and keeps their content stored so the diff stays
+# reconstructable. Without it, ".env.example" / "id_rsa.pub" / public certs were
+# mis-flagged as secret -> content withheld -> their real diffs became unviewable.
+SENSITIVE_ALLOW_EXACT = {
+    "fullchain.pem", "chain.pem", "cert.pem", "ca.pem", "ca-cert.pem",
+    "cacert.pem", "dhparam.pem", "public.pem",
+}
+SENSITIVE_ALLOW_RE = re.compile(
+    r"(?i)(?:\.env|\.dev\.vars)(\.[^.]+)*\.(example|sample|template|tmpl|dist|default|spec)$")
+# NOTE on sc-2 (Secret.md / Secrets/ false-positives): a doc-extension carve-out
+# was tried and REVERTED. Marking secret(s).md non-sensitive *also* stored its
+# bytes in the CAS, so a file genuinely named secrets.md that holds real secrets
+# would leak at rest -- and the content sniff only catches key-SHAPED secrets,
+# not API_KEY=.../prose. Over-flagging an innocent doc (content withheld + audit
+# noise) is the fail-safe price; never trade the at-rest guarantee for it.
+
+# "Bearer <cred>" is handled separately from the token-shape list because it is
+# prose-aware: a shell COMMAND with "Bearer x" is almost always an auth header, so
+# it is masked greedily (\S+); a PROMPT is prose where "the ring Bearer carried it"
+# must survive, so there we require a TOKEN-shaped credential (>=16 token chars).
+# "Authorization: Bearer <cred>" is caught by AUTH_HEADER_RE regardless of either.
+BEARER_LOOSE_RE = re.compile(r"(?i)\bBearer\s+\S+")
+BEARER_STRICT_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/\-]{16,}=*")
+# Standalone high-signal token SHAPES; the WHOLE match is replaced by <redacted>.
+TOKEN_SHAPE_RES = [
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}"),           # OpenAI-style
+    re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}"),  # Stripe secret key
+    re.compile(r"\brk_(?:live|test)_[A-Za-z0-9]{16,}"),  # Stripe restricted key
+    re.compile(r"\bgh[opsru]_[A-Za-z0-9]{20,}"),     # ghp_/gho_/ghs_/ghr_/ghu_ family
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}"),       # GitLab personal access token
+    re.compile(r"\bhvs\.[A-Za-z0-9_\-]{20,}"),        # HashiCorp Vault service token
+    re.compile(r"\bAKIA[0-9A-Z]{12,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{35}"),         # Google API key
+    re.compile(r"\bxox[baeprs]-[A-Za-z0-9\-]+"),     # Slack (incl. xoxe config token)
+    re.compile(r"\bxapp-[0-9]-[A-Za-z0-9\-]{8,}"),   # Slack app-level token
+    # JWT: header.payload.signature, both first segments base64url of a JSON '{"…'.
+    re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}"),
+]
+# key=value / key:value INCLUDING compound env names. The surrounding [\w-]
+# absorbs the prefix/suffix (so DB_PASSWORD=, AWS_SECRET_ACCESS_KEY=, PGPASSWORD=
+# are caught -- the old leading \b left every underscore-compound name unmasked).
+# The {0,40} BOUND on those runs is load-bearing: an unbounded [\w-]* around an
+# alternation backtracks catastrophically (ReDoS) on a long token with no '='.
+# Group 1 = name+delimiter (kept verbatim); group 2 = the value (masked); a
+# quoted value is swallowed whole so "k=a b c" doesn't leak the tail.
+KV_SECRET_RE = re.compile(
+    r"(?i)([\w-]{0,40}(?:api[_-]?key|secret|passw(?:or)?d|passphrase|pwd|"
+    r"pgpass(?:word)?|session[_-]?token|token|auth|access[_-]?key|"
+    r"client[_-]?secret|private[_-]?key)[\w-]{0,40}\s*[=:]\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s;|&]+)")
+# user:pass@host embedded in a URL (group 2 = password, masked). The user part is
+# OPTIONAL so redis://:pass@host (empty user) is still caught. The scheme run is
+# BOUNDED ({0,15}); an unbounded [a-z0-9+.\-]* before '://' backtracks
+# quadratically on long '://'-free text (ReDoS), which matters now that redaction
+# runs on the UNtruncated string (see redact_command/redact_prompt).
+# The password run is [^/\s]+ (allows '@' and ':' INSIDE the credential) and group 3
+# anchors the LAST '@host' -- a greedy password that backtracks to that final '@'
+# masks a whole password containing '@'/':' (e.g. 'MyP@ss:w0rd'), which the old
+# [^/\s:@]+ leaked the tail of. The host class excludes '@'/':'/'/' so the port/path
+# stay outside the mask; one greedy group + an anchored tail stays linear (no ReDoS).
+URL_CRED_RE = re.compile(
+    r"(?i)([a-z][a-z0-9+.\-]{0,15}://[^/\s:@]*:)([^/\s]+)(@[^/\s@:]+)")
+# --password VALUE / --token=VALUE long flags (group 1 = flag+delim, kept).
+# --password VALUE / --token=VALUE. The delimiter is (?:=\s*|\s+) so MULTIPLE spaces
+# between the flag and the value (`--password   hunter2`) are consumed -- the old
+# single [=\s] left the value unmasked after extra spacing.
+FLAG_SECRET_RE = re.compile(
+    r"(?i)(--(?:password|passwd|passphrase|token|secret|api[_-]?key|auth|"
+    r"private[_-]?key)(?:=\s*|\s+))"
+    r"(\"[^\"]*\"|'[^']*'|[^\s;|&]+)")
+# High-confidence SHORT credential flags where the meaning is unambiguous:
+#   sshpass -p<pass> / -p <pass>   (always a password)
+#   curl -u user:pass              (basic-auth userinfo; require the ':' shape so a
+#                                   bare -u/-p in another tool isn't over-masked)
+SSHPASS_RE = re.compile(r"(?i)(\bsshpass\s+-p\s*)(\"[^\"]*\"|'[^']*'|[^\s;|&]+)")
+# Short DB password flags, SCOPED to tools where `-p`/`-a` is unambiguously a password
+# (mysql/mariadb/mongosh -p; redis-cli -a). Deliberately NOT `docker -p` (port) or
+# `psql -p` (port). The value must start alnum so a bare `-p -e ...` (prompt form) does
+# not mask the next flag. The tool-to-flag gap is bounded ({0,300}) to stay linear.
+DB_P_PASS_RE = re.compile(
+    r"(?i)\b(?:mysql|mysqldump|mariadb|mongosh)\b[^\n]{0,300}?(\s-p)\s*([A-Za-z0-9][^\s;|&]*)")
+REDIS_A_PASS_RE = re.compile(
+    r"(?i)\bredis-cli\b[^\n]{0,300}?(\s-a)\s*([A-Za-z0-9][^\s;|&]*)")
+# curl basic-auth: `-u user:pass`, attached `-uuser:pass`, `--user user:pass`,
+# `--user=user:pass`. Require the `user:pass` colon shape so a bare -u/--user in
+# another tool isn't over-masked. Group 1 = flag+user:, group 2 = the password.
+CURL_USERPASS_RE = re.compile(
+    r"(?i)((?<![\w-])(?:-u\s*|--user[=\s]\s*)[^\s:;|&]+:)([^\s;|&]+)")
+# Authorization: <scheme> <credential> -- mask the credential, keep the scheme.
+# (KV_SECRET_RE alone masked only the scheme word 'token'/'basic', leaking the
+# credential after it.) Group 1 = "Authorization: scheme ", group 2 = the cred.
+AUTH_HEADER_RE = re.compile(
+    r"(?i)(authorization\s*:\s*(?:bearer|token|basic|digest)\s+)(\"[^\"]*\"|'[^']*'|[^\s;|&]+)")
+# Cloud-CLI credentials passed as a SPACE-delimited positional arg, e.g.
+# `aws configure set aws_secret_access_key VALUE` -- no =/: so the other rules miss
+# it. Group 1 = the key name + space, kept; group 2 = the value, masked.
+ARG_SECRET_RE = re.compile(
+    r"(?i)\b(aws_secret_access_key|aws_access_key_id|aws_session_token)(\s+)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s;|&]+)")
+
+# The unambiguous private-key header. Checked even for allowlisted names so a real
+# key body can never sit at rest under a public/template filename (atrest-1).
+PRIVATE_KEY_RE = re.compile(
+    rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----")
+# CONTENT sniff: if a file's content looks like a private key / cloud credential we
+# refuse to store its bytes EVEN IF the name heuristic missed it. This makes the
+# "secret content never at rest" guarantee robust to classifier recall gaps.
+#
+# Two tiers. HIGH-CONFIDENCE anchored vendor SHAPES (below) effectively never occur
+# in genuine public-key / certificate bytes: standard base64 has no '-', and an
+# accidental "AKIA"+12 uppercase-alnum run is astronomically unlikely. So these are
+# scanned over the WHOLE content EVEN for a sniff-exempt (*.pub / public-cert) name
+# -- closing the "public head + appended cloud token" leak. This is the byte mirror
+# of TOKEN_SHAPE_RES.
+SECRET_CONTENT_TOKEN_RES = [
+    PRIVATE_KEY_RE,
+    re.compile(rb"\bAKIA[0-9A-Z]{12,}"),
+    re.compile(rb"\bAIza[0-9A-Za-z_\-]{35}"),               # Google API key
+    re.compile(rb"\bgh[opsru]_[A-Za-z0-9]{20,}"),           # ghp_/gho_/ghs_/ghr_/ghu_
+    re.compile(rb"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(rb"\bglpat-[A-Za-z0-9_\-]{20,}"),            # GitLab PAT
+    re.compile(rb"\bhvs\.[A-Za-z0-9_\-]{20,}"),             # Vault service token
+    re.compile(rb"\bxox[baeprs]-[A-Za-z0-9\-]{8,}"),        # Slack (incl. xoxe)
+    re.compile(rb"\bxapp-[0-9]-[A-Za-z0-9\-]{8,}"),         # Slack app-level token
+    re.compile(rb"\bsk-[A-Za-z0-9_\-]{8,}"),                # OpenAI-style
+    re.compile(rb"\bsk_(?:live|test)_[A-Za-z0-9]{16,}"),    # Stripe secret key
+    re.compile(rb"\brk_(?:live|test)_[A-Za-z0-9]{16,}"),    # Stripe restricted key
+    re.compile(rb"\beyJ[A-Za-z0-9_-]{6,}\.eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}"),  # JWT
+    # scheme://user:pass@host connection string (the byte mirror of URL_CRED_RE).
+    # Without this a `postgres://appuser:Sup3rSecret@db/prod` in a normally-named
+    # config file (database.yml, docker-compose.yml, settings.py) was stored in the
+    # CAS verbatim while the SAME string was masked in a command -- a parity gap
+    # that broke the "file contents are never stored [in cleartext]" promise.
+    # scheme://user:pass@host -- password run allows '@'/':' INSIDE it (mirrors the
+    # string URL_CRED_RE), greedily backtracking to the LAST '@host' so a password
+    # containing '@' is still detected, not just up to its first '@'.
+    re.compile(rb"[a-zA-Z][a-zA-Z0-9+.\-]{0,15}://[^/\s:@]*:[^/\s]+@[^/\s@:]+"),
+]
+# BROADER value-shaped patterns that COULD (rarely) trip on certificate metadata or
+# structured public text. These are SKIPPED for structurally-public sniff-exempt
+# content, and run for everything else. Each requires an actual VALUE after the key
+# name, not a bare mention, so a README naming AWS_SECRET_ACCESS_KEY is not withheld.
+# Secret-ish KEY NAMES for the content sniff, kept at PARITY with the command
+# redactor's KV_SECRET_RE (bare `secret`/`token`/`auth` were missing, so a
+# `{"secret":"..."}` / `{"token":"..."}` config was stored while the same string in
+# a command was masked). Longest alternatives first so a compound name still matches.
+_SECRET_KEY_NAMES = (
+    rb"passphrase|password|passwd|pgpass(?:word)?|pwd|"
+    rb"secret[_-]?(?:access[_-]?)?key|client[_-]?secret|access[_-]?key|api[_-]?key|"
+    rb"session[_-]?token|auth[_-]?token|private[_-]?key|credential|secret|token|auth")
+SECRET_CONTENT_BROAD_RES = [
+    re.compile(rb"(?i)aws_secret_access_key['\"\s]*[=:]['\"\s]*[A-Za-z0-9/+]{16,}"),
+    # A credential assigned a QUOTED value in structured config (yaml/json/toml/env),
+    # e.g. `DB_PASSWORD: "hunter2"`, `{"secret":"..."}`. Requiring quotes keeps this
+    # from withholding ordinary source like `password = get_secret()`.
+    re.compile(rb"(?i)(?:" + _SECRET_KEY_NAMES + rb")['\"]?\s*[:=]\s*['\"][^'\"\r\n]{6,}['\"]"),
+    # The `[\w-]{0,40}` run around the key name is BOUNDED for the same reason as
+    # KV_SECRET_RE (see L189-191): an unbounded `[\w-]*` after this alternation
+    # backtracks quadratically (ReDoS) on a long keyword run with no `:`/`=` (e.g.
+    # a planted `b"auth"*n` file), hanging the hook inside re -- a blocked C loop
+    # main()'s fail-open cannot interrupt. 40 chars covers every real compound name.
+    # UNQUOTED KEY=value / KEY: value secret (the .env / .envrc / yaml / WireGuard
+    # `PrivateKey =` form, e.g. `password: swordfish`, `API_KEY=supersecret`). No
+    # placeholder/value exemption: three attempts at one (round 6-7) each leaked a
+    # real secret that started with or merely contained a placeholder word, so the
+    # exemption is GONE -- fail-safe. The only guard is `(?![\w(])`, which spares
+    # `password = get_secret()` source. COST: a `.env.example` with a 6+ placeholder
+    # value (`API_KEY=replace_me_example`) is now WITHHELD (its diff is digest-only in
+    # `alog`); templates are committed to git anyway, so this is an acceptable trade
+    # for never leaking a real unquoted secret.
+    re.compile(rb"(?i)(?:" + _SECRET_KEY_NAMES + rb")[\w-]{0,40}\s*[:=]\s*"
+               rb"([A-Za-z0-9/+._\-]{6,})(?![\w(])"),
+    # HIGH-CONFIDENCE names get NO length floor: a real secret can be short
+    # (`password: abcde`). Any non-empty value that isn't a function call is withheld
+    # (again no placeholder/boolean lookahead -- see above; a `password: false` config
+    # flag being withheld is the fail-safe price).
+    re.compile(rb"(?i)(?:password|passwd|passphrase|pgpassword|client[_-]?secret|"
+               rb"secret[_-]?access[_-]?key|private[_-]?key)[\w-]{0,40}\s*[:=]\s*['\"]?"
+               rb"([A-Za-z0-9/+._\-]{1,})(?![\w(])"),
+]
+# The full sniff (both tiers) for a non-exempt file.
+SECRET_CONTENT_RES = SECRET_CONTENT_TOKEN_RES + SECRET_CONTENT_BROAD_RES
+# Structurally-PUBLIC content shapes. A sniff-exempt NAME (*.pub / a public-cert
+# allowlist entry) only actually earns the exemption if its BYTES start like public
+# material -- otherwise the ".pub" is just an attacker-chosen suffix on a file that
+# holds a real token, and the exemption would store that secret in cleartext.
+PUBLIC_MATERIAL_PREFIXES = (
+    b"ssh-", b"ecdsa-", b"sk-ssh-",                 # OpenSSH public keys
+    b"-----BEGIN CERTIFICATE-----",
+    b"-----BEGIN PUBLIC KEY-----",
+    b"-----BEGIN RSA PUBLIC KEY-----",
+    b"-----BEGIN DH PARAMETERS-----",
+)
+
+# PEM private-key block masking for STRINGS (commands/prompts). The file path uses
+# the bytes PRIVATE_KEY_RE as an unconditional at-rest guard (atrest-1); a pasted
+# key in a prompt/command needs the same protection before it lands in the log.
+# Masked by a LINEAR scanner (mask_pem_blocks), NOT a `HDR.*?FTR` regex: a lazy
+# `.*?` between header and footer retries from EVERY header on input with many
+# headers and no footer, which is quadratic (ReDoS) -- and redaction runs on the
+# UNtruncated command/prompt, so a large crafted paste could stall the hook.
+_PEM_HDR_RE = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")
+_PEM_FTR_RE = re.compile(r"-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")
+
+
+def mask_pem_blocks(text: str) -> str:
+    """Replace each PEM PRIVATE KEY block with a marker, in O(n).
+
+    For each BEGIN header, mask through the matching END (or to end-of-text if the
+    footer is absent -- a key truncated by the length cap; the body after an
+    unterminated header is exactly the secret). Each search advances the cursor, so
+    the whole pass is linear regardless of how many headers appear."""
+    if "-----BEGIN " not in text:            # cheap fast-path: no PEM header at all
+        return text
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        m = _PEM_HDR_RE.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        out.append(text[i:m.start()])
+        out.append("<redacted: private key>")
+        ftr = _PEM_FTR_RE.search(text, m.end())
+        if ftr:
+            i = ftr.end()
+        else:
+            # Dangling header (no END): mask only the following PEM-BODY run
+            # (base64 / whitespace / dashes), NOT the entire rest of the string --
+            # else `echo "-----BEGIN PRIVATE KEY-----"; rm -rf /` would swallow the
+            # `rm` and hide it from the audit. Stop at the first non-body char (a
+            # shell metacharacter, a quote, a word), preserving what follows.
+            j = m.end()
+            # PEM base64 body chars only (NO space/tab/dash): a real key body is
+            # line-wrapped base64. Including space let `-----BEGIN PRIVATE KEY----- rm
+            # file` swallow the trailing `rm file` command tokens into the mask.
+            while j < n and (text[j].isalnum() or text[j] in "+/=\r\n"):
+                j += 1
+            i = j
+    return "".join(out)
+
+# A command longer than this is truncated for STORAGE (after redaction) so the log
+# stays bounded. Redaction runs on the full string first (so a secret near the cap
+# keeps its mask); the regexes are individually bounded to stay linear regardless.
+MAX_COMMAND_CHARS = 8192
+# A recorded user prompt is bounded the same way: the audit wants "what was
+# asked", not a whole pasted file, and a huge paste should not bloat the log.
+# Redaction (redact_prompt) still masks inline secrets before this is stored.
+MAX_PROMPT_CHARS = 4096
+# Per-Stop cap on how many transcript bytes are read into memory at once, so a huge
+# (or maliciously swapped) transcript can't OOM the hook. The cursor advances by the
+# complete lines consumed; any remainder is read on the next Stop.
+MAX_TRANSCRIPT_READ = 64 * 1024 * 1024
+# Cap on the hook's stdin payload, so a huge Write content (or a malicious payload)
+# can't OOM the process before the fail-open guards run. Generous for a real Write.
+MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
+# Extra flags for FIXED-PATH store files (lock/salt/session-log/cursor): O_NOFOLLOW
+# refuses a symlinked store file; O_NONBLOCK makes an O_WRONLY open of a FIFO (that a
+# malicious agent swapped in, since .alog lives under cwd) fail with ENXIO instead of
+# blocking the hook forever. On a regular file these are no-ops.
+_SAFE_STORE_OPEN = os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+
+
+@contextlib.contextmanager
+def safe_store_read(path, mode="rb", encoding=None, errors=None):
+    """Open a FIXED-PATH store file (salt/session-log/manifest/pending/cursor) for
+    READING without the two failure modes a plain open() has when a malicious agent
+    swaps the node (``.alog`` lives under cwd): O_NONBLOCK returns immediately for a
+    writer-less FIFO instead of parking the hook forever, O_NOFOLLOW refuses a
+    symlinked store file, and the post-open ``fstat`` rejects any non-regular fd.
+
+    This is the READ mirror of ``_SAFE_STORE_OPEN`` (which hardened only the store
+    WRITE opens) and of ``parse_transcript_turns`` (which already does this for the
+    transcript). Raises ``OSError`` -- which every caller already catches -- when the
+    path is missing, a symlink, a FIFO/device, or otherwise not a regular file.
+    """
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fh = os.fdopen(fd, mode, encoding=encoding, errors=errors)
+    except OSError:
+        os.close(fd)
+        raise
+    try:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular store file", path)
+        yield fh
+    finally:
+        fh.close()
+
+# Hook events that carry NO tool_name but still feed the audit log: the user's
+# prompt (what the agent was asked) and end-of-turn token/cost (read from the
+# session transcript). Kept separate from the tool-gated Pre/PostToolUse path.
+NONTOOL_EVENTS = {"UserPromptSubmit", "Stop", "SubagentStop"}
+
+# Pending-stack bounds: orphan Pres (denied/aborted tools that never get a Post)
+# must not accumulate without bound. TTL is wall-clock (skipped under a frozen
+# test clock); the length cap is always enforced.
+MAX_PENDING = 512
+PENDING_TTL_SECONDS = 6 * 3600
+
+# Tokens are split out of a command on shell separators to be classified.
+CMD_SPLIT_RE = re.compile(r"[\s;|&><()\"'`]+")
+
+
+# ---- helpers -------------------------------------------------------------
+
+def log_internal(msg: str) -> None:
+    if os.environ.get("ALOG_DEBUG"):
+        sys.stderr.write("alog-hook: {0}\n".format(msg))
+
+
+def data_dir(cwd: str) -> str:
+    return os.environ.get("ALOG_DATA") or os.path.join(cwd, ".alog")
+
+
+def ensure_dirs(base: str) -> None:
+    """Create the store 0700, with a 0600 .gitignore (*) so it never commits."""
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(base, 0o700)
+    for sub in ("objects", "sessions", "pending", "locks", "manifests", "cursors"):
+        d = os.path.join(base, sub)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(d, 0o700)
+    gi = os.path.join(base, ".gitignore")
+    if not os.path.exists(gi):
+        with open(gi, "w", encoding="utf-8") as fh:
+            fh.write("# audit store may hold sensitive material -- never commit\n*\n")
+        with contextlib.suppress(OSError):
+            os.chmod(gi, 0o600)
+
+
+def get_salt(base: str) -> bytes:
+    """Per-store random salt for sensitive-file digests (0600). Created once.
+
+    Salting means a recorded sensitive digest is not a plain sha256(content),
+    so it cannot be used to confirm a guessed low-entropy secret offline.
+    """
+    path = os.path.join(base, "salt")
+    for _ in range(100):
+        # Reader path: only trust a fully-written salt (>=16 bytes). A racing
+        # creator may have made the file but not yet written it.
+        if os.path.exists(path):
+            try:
+                with safe_store_read(path, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                data = b""
+            if len(data) >= 16:
+                return data
+            time.sleep(0.005)
+            continue
+        # Writer path: O_EXCL means exactly one process wins the create; the
+        # loser gets FileExistsError and falls back to the reader path. (No
+        # exists()->create gap: the old TOCTOU dropped the loser's whole event
+        # and an empty-salt read degraded the digest to an unsalted oracle.)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _SAFE_STORE_OPEN, 0o600)
+        except FileExistsError:
+            continue
+        salt = os.urandom(16)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(salt)
+        return salt
+    # After the whole wait budget the file still exists but is <16 bytes: the
+    # original creator died between the O_EXCL create and the write (SIGKILL on a
+    # hook timeout, or ENOSPC), leaving a TRUNCATED salt. Returning it would make
+    # sensitive_digest(short_salt, content) effectively unsalted -- a sha256(content)
+    # oracle that lets an attacker offline-confirm a guessed low-entropy secret, the
+    # exact property the salt exists to defeat. Heal it: replace with a full 16-byte
+    # salt atomically, then re-read so concurrent healers converge on one value.
+    # NEVER return a salt shorter than 16 bytes.
+    salt = os.urandom(16)
+    tmp = "{0}.{1}.{2}.tmp".format(path, os.getpid(), os.urandom(6).hex())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(salt)
+        os.replace(tmp, path)
+        with safe_store_read(path, "rb") as fh:
+            data = fh.read()
+        return data if len(data) >= 16 else salt
+    except OSError:
+        with contextlib.suppress(OSError):
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        # Could not heal (e.g. disk still full): use the in-memory salt for THIS run
+        # so digests stay salted rather than degrading to an unsalted oracle.
+        with contextlib.suppress(OSError):
+            with safe_store_read(path, "rb") as fh:
+                data = fh.read()
+            if len(data) >= 16:
+                return data
+        return salt
+
+
+def now_ts(base: str) -> float:
+    """Wall-clock epoch, unless ALOG_FROZEN_CLOCK pins a constant (for tests).
+
+    When frozen the value is constant; events are ordered by ``seq`` (a
+    per-session monotonic counter), not by this timestamp.
+    """
+    frozen = os.environ.get("ALOG_FROZEN_CLOCK")
+    if frozen:
+        return float(frozen)
+    return time.time()
+
+
+def is_allowlisted(path: str) -> bool:
+    """NAME-based classification only: public / template artifacts that is_sensitive
+    treats as NOT secret (public keys, public certs, env/vars templates), so they
+    don't add audit noise and their clean content stays diffable.
+
+    This governs ONLY the name heuristic -- it does NOT control at-rest storage.
+    The content-sniff exemption is a strict SUBSET handled separately by
+    is_sniff_exempt(), which deliberately does NOT exempt env/vars templates: a real
+    secret copy-pasted into a .env.example is still withheld (recorded as a salted
+    digest), never stored. Do not route the storage decision through this function
+    -- doing so would leak template secrets at rest.
+    """
+    lname = os.path.basename(path.replace("\\", "/")).lower()
+    if lname.endswith(".pub"):
+        return True
+    if lname in SENSITIVE_ALLOW_EXACT:
+        return True
+    if SENSITIVE_ALLOW_RE.search(lname):
+        return True
+    return False
+
+
+def is_sniff_exempt(path: str) -> bool:
+    """Names for which only the BROAD value-shaped content patterns are skipped --
+    a strict subset of is_allowlisted. Only structurally-public artifacts qualify:
+    public keys (*.pub) and public certificates.
+
+    This exemption is NOT a blanket skip: the high-confidence vendor token shapes
+    (content_has_token_shape) and the private-key header are still scanned over the
+    whole body even for an exempt name, so a cloud token (AWS/Stripe/Google/JWT)
+    appended after a genuine public-key head is still withheld from the store. Only
+    the broad quoted-KV / aws_secret patterns -- which could trip on certificate
+    metadata -- are relaxed. And the exemption applies only when the content itself
+    starts as public material (content_is_public_material), not on the name alone.
+
+    Env/vars TEMPLATES (.env.example, .dev.vars.template, ...) are deliberately
+    NOT exempt: copying a real .env to .env.example without stripping values is a
+    common leak, so those keep the full sniff active. is_sensitive still treats all
+    of them as non-sensitive by name (no audit noise); this narrower gate only
+    governs at-rest content storage."""
+    lname = os.path.basename(path.replace("\\", "/")).lower()
+    if lname.endswith(".pub"):
+        return True
+    if lname in SENSITIVE_ALLOW_EXACT:
+        return True
+    return False
+
+
+def is_sensitive(path: str) -> bool:
+    """Precise filename/path heuristic for 'this is probably a secret'.
+
+    Order matters: a sensitive DIRECTORY SEGMENT (.ssh, .aws, secrets, ...) is
+    checked FIRST and wins over the public/template allowlist -- so
+    `secrets/.env.example` is flagged even though the basename is allowlisted (a
+    template that lives inside a secrets dir is not safe to store). Then the
+    allowlist, exact names, and globs. Callers pass the cwd-RELATIVE display path
+    (so a generic 'secrets'/'gcloud' segment only matches WITHIN the repo, not a
+    coincidental ancestor); the abspath dot-folder case is handled separately by
+    abspath_has_sensitive_dir. All matching is case-insensitive.
+    """
+    norm = path.replace("\\", "/")
+    name = os.path.basename(norm)
+    lname = name.lower()
+    # 1) sensitive directory segments FIRST (an exact dir component, never a
+    # substring of the whole path so "wisshful.txt" isn't flagged for ".ssh").
+    # This precedes the allowlist so an allowlisted basename can't override a
+    # secrets/.ssh/.aws directory.
+    dir_parts = [p.lower() for p in norm.split("/")[:-1] if p]
+    for seg in SENSITIVE_PATH_SEGMENTS:
+        if seg in dir_parts:
+            return True
+    # 2) allowlist -- public keys, public certs, env templates are not secrets.
+    if is_allowlisted(path):
+        return False
+    # 3) exact names (the literals are already lowercase).
+    if lname in SENSITIVE_EXACT_NAMES:
+        return True
+    # 4) globs (case-insensitive via the lowercased name).
+    for glob in SENSITIVE_GLOBS:
+        if fnmatch.fnmatch(lname, glob):
+            return True
+    return False
+
+
+def abspath_has_sensitive_dir(abs_path: str) -> bool:
+    """True if any dir component of the ABSOLUTE path is an unambiguous sensitive
+    config dot-dir (.ssh/.aws/...). Handles the case where the agent's cwd is INSIDE
+    such a dir (so the relative display path lost the segment). Generic nouns
+    (secrets/gcloud) are deliberately NOT checked here -- an ancestor named 'secrets'
+    is a common project location and must not wholesale-withhold the repo."""
+    parts = [p.lower() for p in abs_path.replace("\\", "/").split("/")[:-1] if p]
+    return any(seg in parts for seg in SENSITIVE_DIR_SEGMENTS_ABS)
+
+
+def path_is_sensitive(ap: str, disp: str, cwd: str) -> bool:
+    """Full sensitivity classification for a snapshot: the display name/segments, an
+    unambiguous ancestor dot-dir, OR -- resolving SYMLINKED ANCESTORS -- the real
+    target's location. A symlinked parent (alias -> secrets/) makes the LEXICAL path
+    non-sensitive while the bytes actually live under a sensitive dir; O_NOFOLLOW only
+    guards the FINAL component, so os.open still follows the parent and would store the
+    target. (realpath is best-effort: a concurrent swap of the ancestor is raceable.)"""
+    if is_sensitive(disp):
+        return True
+    if abspath_has_sensitive_dir(os.path.abspath(ap)):
+        return True
+    # Resolve SYMLINKED ANCESTORS. Relativize against the RESOLVED cwd so a system
+    # symlink prefix (/var->/private/var, /tmp->/private/tmp) doesn't expose an
+    # ancestor segment -- only a symlink WITHIN the path (alias -> secrets/) then
+    # surfaces a sensitive segment in the relative form.
+    try:
+        rp = os.path.realpath(ap)
+        rcwd = os.path.realpath(cwd)
+    except OSError:
+        return False
+    if abspath_has_sensitive_dir(rp) or is_sensitive(rel_to_cwd(rcwd, rp)):
+        return True
+    return False
+
+
+def content_looks_secret(content: bytes) -> bool:
+    """True if content matches ANY private-key / cloud-credential shape (both the
+    high-confidence vendor shapes and the broader value-shaped patterns). Used for
+    a non-exempt file, where the whole content is fair game to withhold."""
+    for rx in SECRET_CONTENT_RES:
+        if rx.search(content):
+            return True
+    return False
+
+
+def content_has_token_shape(content: bytes) -> bool:
+    """True if content matches a HIGH-CONFIDENCE anchored vendor token shape
+    (AKIA/AIza/ghp_/github_pat_/xox/sk-/sk_live_/rk_live_/JWT, plus a private-key
+    header). These never occur in genuine public-key / certificate bytes, so they
+    are scanned even for a sniff-EXEMPT name -- a *.pub whose head is a real public
+    key but which has a cloud token appended past the head is still withheld."""
+    for rx in SECRET_CONTENT_TOKEN_RES:
+        if rx.search(content):
+            return True
+    return False
+
+
+def content_has_private_key(head: bytes) -> bool:
+    """True only for an unambiguous private-key header. Run even on allowlisted
+    names: public keys / public certs / env templates never match it, so a real
+    private key can't sit at rest under such a name (atrest-1)."""
+    return bool(PRIVATE_KEY_RE.search(head))
+
+
+def content_is_public_material(head: bytes) -> bool:
+    """True if a file's HEAD structurally begins as PUBLIC key/cert material.
+
+    Used to VERIFY a sniff-exempt name before honouring its exemption: a *.pub or
+    public-cert name only skips the broad credential sniff if its bytes actually
+    look public (ssh-.../-----BEGIN CERTIFICATE-----/...). A file merely NAMED
+    'config.pub' that holds an sk_live_ token does not qualify, so the sniff still
+    runs and its secret is withheld from the store."""
+    h = head.lstrip()
+    return any(h.startswith(p) for p in PUBLIC_MATERIAL_PREFIXES)
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Cap a string, appending how many bytes were dropped (bounds stored size).
+
+    Applied AFTER redaction (see redact_command/redact_prompt), so it never
+    shears a secret out of its mask; the redaction regexes are individually
+    bounded/anchored (e.g. URL_CRED_RE's {0,15} scheme run) to stay linear on the
+    untruncated input."""
+    if len(text) > limit:
+        return text[:limit] + "…[+{0}B truncated]".format(len(text) - limit)
+    return text
+
+
+def _value_looks_secretish(value: str) -> bool:
+    """Heuristic for the PROMPT path only: does a key=value's value look like real
+    key material rather than an ordinary prose word? A secret value tends to be
+    long, or mix letters+digits, or carry symbols; plain words ('yes', 'economics')
+    do not. Used to stop 'auth: yes' / 'token: economics' being mangled while still
+    masking 'api_key: aB3xK9...'. Fail-safe: on doubt for shell COMMANDS we never
+    apply this (commands legitimately carry KEY=secret and are not prose)."""
+    # Strip surrounding quotes AND trailing sentence punctuation: 'auth: yes.' /
+    # 'token: economics,' are prose, but a trailing '.'/',' used to trip the symbol
+    # test below and over-mask them. Real key material still qualifies via length or
+    # an internal letter+digit mix; only a purely-trailing punctuation mark is dropped.
+    v = value.strip("\"'").rstrip(".,!?;:")
+    if len(v) >= 16:
+        return True
+    if any(c.isdigit() for c in v) and any(c.isalpha() for c in v):
+        return True
+    if any((not c.isalnum()) and c not in "-_" for c in v):
+        return True
+    return False
+
+
+# Unambiguous credential key names: their value is a secret regardless of how it
+# looks, so it is masked even in PROSE (where the entropy heuristic would otherwise
+# spare a short dictionary-word value like `password: swordfish`).
+_HIGH_CONF_KV_RE = re.compile(
+    r"(?i)\b(?:password|passwd|passphrase|pgpassword|client[_-]?secret|"
+    r"private[_-]?key|secret[_-]?access[_-]?key)\b")
+
+
+def _kv_sub(match, prose: bool) -> str:
+    # High-confidence key -> always mask (even a short prose value). Otherwise, in
+    # prose, only mask a value that looks like real key material so ordinary phrasing
+    # ('auth: yes') survives.
+    if prose and not _HIGH_CONF_KV_RE.search(match.group(1)) \
+            and not _value_looks_secretish(match.group(2)):
+        return match.group(0)          # ordinary prose 'word: word' -- leave intact
+    return match.group(1) + "<redacted>"
+
+
+def _apply_secret_subs(text: str, prose: bool = False) -> str:
+    """Run every inline-secret masking rule over a string.
+
+    Order matters: a PEM private-key block is masked first (highest value, and
+    masking the whole block avoids the KV/token rules nibbling its interior); then
+    the Authorization-header rule runs before KV so the credential -- not just the
+    scheme word 'token'/'basic' -- is masked. With ``prose=True`` (prompts) the KV
+    rule only fires when the value looks like real key material, so ordinary prose
+    ('auth: yes') is preserved.
+    """
+    out = text
+    out = mask_pem_blocks(out)               # linear PEM masking (no ReDoS)
+    out = AUTH_HEADER_RE.sub(lambda m: m.group(1) + "<redacted>", out)
+    out = ARG_SECRET_RE.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", out)
+    out = SSHPASS_RE.sub(lambda m: m.group(1) + "<redacted>", out)
+    out = DB_P_PASS_RE.sub(lambda m: m.group(1) + "<redacted>", out)
+    out = REDIS_A_PASS_RE.sub(lambda m: m.group(1) + "<redacted>", out)
+    out = CURL_USERPASS_RE.sub(lambda m: m.group(1) + "<redacted>", out)
+    out = KV_SECRET_RE.sub(lambda m: _kv_sub(m, prose), out)
+    out = URL_CRED_RE.sub(lambda m: m.group(1) + "<redacted>" + m.group(3), out)
+    out = FLAG_SECRET_RE.sub(lambda m: m.group(1) + "<redacted>", out)
+    out = (BEARER_STRICT_RE if prose else BEARER_LOOSE_RE).sub("<redacted>", out)
+    for rx in TOKEN_SHAPE_RES:
+        out = rx.sub("<redacted>", out)
+    return out
+
+
+# How much MORE than the stored cap to run redaction over: enough to mask a secret
+# that straddles the cap boundary, without scanning a possibly-multi-MB command in
+# full (which would make every redaction regex traverse the whole text and stall the
+# hook). Bytes past (cap + margin) are truncated away, so they are never stored.
+_REDACT_MARGIN = 4096
+
+
+def _redact_bounded(text: str, cap: int, prose: bool) -> str:
+    """Redact a prefix of the text, then truncate to `cap`. Redaction runs over only
+    (cap + margin) chars so it stays fast on a huge input; the tail beyond that is
+    truncated away (never stored). Redact-before-truncate keeps a secret straddling
+    the cap from being sheared out of its own mask."""
+    red = _apply_secret_subs(text[:cap + _REDACT_MARGIN], prose)
+    if len(text) > cap:
+        return red[:cap] + "…[+{0}B truncated]".format(len(text) - cap)
+    return red
+
+
+def redact_command(command: str) -> str:
+    """Best-effort masking of inline secrets before a command is stored."""
+    return _redact_bounded(command, MAX_COMMAND_CHARS, prose=False)
+
+
+def redact_prompt(text: str) -> str:
+    """Best-effort masking of inline secrets in a user prompt before it is stored.
+
+    A prompt is prose, not a shell line, but a pasted `API_KEY=...`, Bearer token,
+    `user:pass@host` URL, or PEM private key leaks the same way, so the same masks
+    apply (with `prose=True` so ordinary `word: word` phrasing is not mangled).
+    This is a backstop, not a guarantee: freeform secrets with no recognisable
+    shape are not caught -- the audit records what was asked, and keeping the store
+    from being a cleartext secret sink is a best-effort property here (unlike file
+    content, where the CAS never persists a sensitive blob at all).
+
+    Redact before truncating (see redact_command) so a secret near the length cap
+    can't be split out of its own mask by the truncation boundary."""
+    return _redact_bounded(text, MAX_PROMPT_CHARS, prose=True)
+
+
+def _normalize_cmd_path(tok: str, cwd: str) -> str:
+    """Render a command-line path token into the SAME display form a change path
+    uses, but ONLY for a token that resolves INSIDE cwd: './.env' -> '.env'.
+
+    Without this the reader's de-dup ('marker in change-paths') never matches a
+    non-normalized in-tree token against its own changed file, so one sensitive
+    file is counted twice -- once as a change and once as a command-ref. A '~/...',
+    an absolute path, or an out-of-tree '../x' is left verbatim: it never collides
+    with an under-cwd change path, and keeping it as written stays readable."""
+    if tok.startswith("~") or os.path.isabs(tok):
+        return tok
+    disp = rel_to_cwd(cwd, os.path.join(cwd, tok))
+    # rel_to_cwd returns an ABSOLUTE path when the token escaped cwd ('../x'); in
+    # that case keep the original token rather than rewrite it to an absolute path.
+    return disp if not os.path.isabs(disp) else tok
+
+
+def scan_cmd_for_secrets(command: str, cwd: str) -> List[str]:
+    """Sensitive paths referenced by a Bash command (tokenized + classified).
+
+    Returned paths are normalized to the change-path display form so the reader
+    can de-dup a command-ref against the same file's recorded change."""
+    found: List[str] = []
+    for raw in CMD_SPLIT_RE.split(command):
+        raw = raw.strip()
+        if not raw:
+            continue
+        candidates = []
+        if "=" in raw:               # --kubeconfig=/p, FOO=/p -- classify the RHS
+            candidates.append(raw.split("=", 1)[1])
+        elif not raw.startswith("-"):  # plain path token (elif: don't double-count
+            candidates.append(raw)     # a 'NAME=/path' as both RHS and whole token)
+        for tok in candidates:
+            if not tok:
+                continue
+            probe = tok[2:] if tok.startswith("~/") else tok
+            hit = is_sensitive(probe)
+            if not hit:
+                # A symlink whose target is sensitive: `cat alias.txt` (-> .env) would
+                # otherwise not be flagged, since the token's own name isn't sensitive.
+                with contextlib.suppress(OSError):
+                    resolved = probe if os.path.isabs(probe) else os.path.join(cwd, probe)
+                    if os.path.islink(resolved) and is_sensitive(os.path.realpath(resolved)):
+                        hit = True
+            if hit:
+                disp = _normalize_cmd_path(tok, cwd)
+                if disp not in found:
+                    found.append(disp)
+    return found
+
+
+def store_blob(base: str, content: bytes) -> str:
+    """Write content into the CAS (sha256, write-once, 0600); return hex sha.
+
+    The tmp name is per-writer unique (pid + random) so two sessions writing the
+    same object don't share one ``.tmp`` and clobber each other mid-publish.
+    os.replace is atomic and the content is identical, so a racing publish is
+    harmless; we just suppress the loser's ENOENT.
+    """
+    sha = hashlib.sha256(content).hexdigest()
+    obj_dir = os.path.join(base, "objects", sha[:2])
+    obj_path = os.path.join(obj_dir, sha)
+    if not os.path.exists(obj_path):
+        os.makedirs(obj_dir, mode=0o700, exist_ok=True)
+        # Heal a pre-existing prefix dir loosened by a copy/umask: a 0700 objects
+        # dir blocks other local users from reaching the blobs inside regardless of
+        # each blob's own mode (new blobs are written 0600 via the tmp below).
+        with contextlib.suppress(OSError):
+            os.chmod(obj_dir, 0o700)
+        tmp = "{0}.{1}.{2}.tmp".format(obj_path, os.getpid(), os.urandom(6).hex())
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(content)
+            with contextlib.suppress(FileNotFoundError):
+                os.replace(tmp, obj_path)
+        finally:
+            with contextlib.suppress(OSError):
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+    return sha
+
+
+def sensitive_digest(salt: bytes, content: bytes) -> str:
+    """Salted, truncated digest for a sensitive file -- NOT stored as a blob."""
+    return "S:" + hashlib.sha256(salt + content).hexdigest()[:16]
+
+
+def _toolarge_rec(st, sensitive: bool) -> Dict:
+    """Record for a file too big to hash: carry size+mtime+ctime so a change is
+    still detectable (a rewrite bumps ctime even if mtime is forged), and keep the
+    redacted flag for a sensitive large file so it isn't shown as plain content."""
+    return {"sha": None, "size": st.st_size, "toolarge": True,
+            "mtime": st.st_mtime_ns, "ctime": st.st_ctime_ns,
+            "redacted": bool(sensitive)}
+
+
+def _nonregular_rec(abs_path: str) -> Dict:
+    """Record for a non-regular path (symlink / fifo / socket / device).
+
+    Carry the symlink TARGET plus the link's own lstat mtime/ctime so a symlink
+    REPOINTED in place (its target swapped while it stays a symlink) is detectable:
+    without them, before/after are two identical ``sha=None`` stubs that tie in
+    build_changes and a retarget (e.g. ``ln -sf /etc/shadow link``) hides as an
+    unchanged 'read'."""
+    rec: Dict = {"sha": None, "size": 0, "kind": "non-regular"}
+    with contextlib.suppress(OSError):
+        lst = os.lstat(abs_path)
+        rec["mtime"] = lst.st_mtime_ns
+        rec["ctime"] = lst.st_ctime_ns
+        if stat.S_ISLNK(lst.st_mode):
+            with contextlib.suppress(OSError):
+                # Redact the target before storing: a symlink can point AT a secret
+                # (e.g. `ln -s 'postgres://u:pw@host' link`), and the raw readlink()
+                # text would otherwise land in the pending/manifest/event log in
+                # cleartext. It is only compared for equality (repoint detection), so
+                # the redacted form is sufficient.
+                rec["link_target"] = redact_command(os.readlink(abs_path))
+            with contextlib.suppress(OSError):
+                # A symlink whose RESOLVED target is sensitive (alias.txt -> .env) is
+                # a secret access under an innocuous name; O_NOFOLLOW won't read it and
+                # the link's own name isn't sensitive, so flag it here for the audit.
+                if is_sensitive(os.path.realpath(abs_path)):
+                    rec["target_sensitive"] = True
+    return rec
+
+
+def snapshot_file(base: str, abs_path: str, salt: bytes,
+                  sensitive: bool, sniff_exempt: bool = False) -> Optional[Dict]:
+    """Content-address one regular file. None if it does not exist.
+
+    Sensitive files (by name OR by content sniff) are recorded as a salted digest
+    and their content is NOT persisted -- UNLESS the name is sniff-exempt (a public
+    key / public cert; see is_sniff_exempt), in which case the BROAD content sniff
+    is skipped so the public content stays storable and the diff reconstructable.
+    The private-key header check runs regardless. Symlinks are never followed
+    (opened O_NOFOLLOW so a swap after any check can't reach the target); other
+    non-regular paths are recorded as kind='non-regular'.
+    """
+    if not os.path.lexists(abs_path):
+        return None
+    # Open with O_NOFOLLOW so a symlink -- including one swapped in AFTER an earlier
+    # stat (the classify->read TOCTOU) -- is rejected (ELOOP) rather than followed
+    # to its target's bytes. O_NONBLOCK keeps a FIFO/device from blocking the open;
+    # we fstat the real fd and only read regular files.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(abs_path, flags)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            return _nonregular_rec(abs_path)
+        try:
+            st = os.lstat(abs_path)
+        except OSError:
+            return {"sha": None, "size": 0, "unreadable": True}
+        if not stat.S_ISREG(st.st_mode):
+            return _nonregular_rec(abs_path)
+        return {"sha": None, "size": st.st_size, "unreadable": True,
+                "mtime": st.st_mtime_ns, "ctime": st.st_ctime_ns}
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):   # FIFO/socket/device -- not content
+                return _nonregular_rec(abs_path)
+            if st.st_size > MAX_BLOB_BYTES:
+                return _toolarge_rec(st, sensitive)
+            # Read one past the cap: if the file GREW past the limit, treat it as
+            # too-large rather than slurping unbounded bytes.
+            content = fh.read(MAX_BLOB_BYTES + 1)
+    except OSError as exc:
+        log_internal("unreadable {0}: {1}".format(abs_path, exc))
+        # Carry size/mtime so a later change to a still-unreadable file is not
+        # mistaken for an unchanged 'read' (both-None sha would otherwise tie).
+        try:
+            est = os.lstat(abs_path)
+            return {"sha": None, "size": est.st_size, "unreadable": True,
+                    "mtime": est.st_mtime_ns, "ctime": est.st_ctime_ns}
+        except OSError:
+            return {"sha": None, "size": 0, "unreadable": True}
+    if len(content) > MAX_BLOB_BYTES:
+        return _toolarge_rec(st, sensitive)
+    # Withhold content from the store when the NAME says secret, OR the file has an
+    # unambiguous PRIVATE KEY header, OR a credential sniff fires. Scan the WHOLE
+    # stored content, not just a head window: store_blob persists every byte, so a
+    # token past the first few KiB would otherwise land in the CAS in cleartext.
+    #
+    # The public-key/cert sniff exemption was REMOVED: it skipped the BROAD sniff for
+    # a *.pub/cert name, so a non-token secret appended after a genuine public-key head
+    # (e.g. a `password:` line) was stored in cleartext. A real public key / cert never
+    # matches the broad patterns anyway (no `password: value`, and its base64 body won't
+    # form a vendor token), so running the full sniff on EVERYTHING is safe and closes
+    # the leak. `sniff_exempt` is accepted for call-site compatibility but ignored.
+    del sniff_exempt
+    sniff_hit = content_looks_secret(content)
+    # A hard link (st_nlink > 1) can be an alias of a sensitive file under a
+    # non-sensitive name (`ln .env notes.txt`): the same secret bytes reachable via
+    # the innocuous name would otherwise be stored. Conservatively withhold every
+    # multi-linked regular file (over-withholds the rare legit hardlink -- fail-safe).
+    hardlinked = getattr(st, "st_nlink", 1) > 1
+    mode = stat.S_IMODE(st.st_mode)          # permission bits, for chmod detection
+    if sensitive or hardlinked or content_has_private_key(content) or sniff_hit:
+        return {"sha": sensitive_digest(salt, content), "size": len(content),
+                "redacted": True, "mode": mode}
+    return {"sha": store_blob(base, content), "size": len(content), "mode": mode}
+
+
+def rel_to_cwd(cwd: str, abs_path: str) -> str:
+    try:
+        common = os.path.commonpath([os.path.abspath(abs_path), cwd])
+    except ValueError:
+        return abs_path
+    if common == cwd:
+        return os.path.relpath(abs_path, cwd)
+    return abs_path
+
+
+def walk_worktree(cwd: str, store_base: Optional[str] = None) -> List[str]:
+    # ``store_base`` is the audit store's own directory (data_dir()); it is pruned
+    # from the walk by ABSOLUTE PATH, not by the hardcoded name '.alog'. With
+    # ALOG_DATA pointing at an in-repo dir under any other name, the old name-only
+    # skip walked the store itself and stored its 'salt' (plaintext, non-sensitive
+    # by name) into the CAS -- exposing the salt (a known-salt digest oracle) and
+    # re-snapshotting the growing store on every Bash (quadratic growth).
+    skip_abs = os.path.abspath(store_base) if store_base else None
+    out = []
+    for root, dirs, files in os.walk(cwd, followlinks=False):
+        # A symlink to a directory shows up in `dirs`. Record it (so a Bash symlink
+        # swap is visible) but never descend it; real subdirs (minus the skip list)
+        # stay for traversal.
+        keep = []
+        for d in dirs:
+            if d in TREE_SKIP_DIRS:
+                continue
+            dp = os.path.join(root, d)
+            if skip_abs is not None and os.path.abspath(dp) == skip_abs:
+                continue                       # the audit store itself -- never walk it
+            if os.path.islink(dp):
+                out.append(dp)
+            else:
+                keep.append(d)
+        dirs[:] = keep
+        for name in files:
+            abs_path = os.path.join(root, name)
+            try:
+                st = os.lstat(abs_path)
+            except OSError:
+                continue
+            # Record symlinks too -- snapshot_file classifies them non-regular (via
+            # O_NOFOLLOW), so a Bash-created or -replaced symlink is no longer
+            # invisible to the tree diff. Other non-regular entries (fifo/socket/
+            # device) are still skipped.
+            if stat.S_ISLNK(st.st_mode) or stat.S_ISREG(st.st_mode):
+                out.append(abs_path)
+    return out
+
+
+def named_file_path(tool: str, tool_input: Dict, cwd: str) -> Optional[str]:
+    if tool not in SINGLE_FILE_TOOLS:
+        return None
+    fp = tool_input.get("file_path") or tool_input.get("notebook_path")
+    if not fp or not isinstance(fp, str):
+        return None
+    return fp if os.path.isabs(fp) else os.path.join(cwd, fp)
+
+
+def files_of_interest(tool: str, tool_input: Dict, cwd: str) -> List[str]:
+    # Only single-file tools reach here: the Bash whole-tree path goes through
+    # snapshot_tree (see _snapshot), so there is no Bash branch to maintain.
+    if tool in SINGLE_FILE_TOOLS:
+        fp = named_file_path(tool, tool_input, cwd)
+        return [fp] if fp else []
+    return []
+
+
+def snapshot_set(base: str, abs_paths: List[str], cwd: str,
+                 salt: bytes) -> Dict[str, Optional[Dict]]:
+    snap: Dict[str, Optional[Dict]] = {}
+    for ap in abs_paths:
+        disp = rel_to_cwd(cwd, ap)
+        # Classify by the ABSOLUTE path so a sensitive segment ABOVE cwd (e.g. the
+        # agent runs under ~/.ssh, making disp just "config") is still seen.
+        snap[disp] = snapshot_file(base, ap, salt, path_is_sensitive(ap, disp, cwd),
+                                   is_sniff_exempt(disp))
+    return snap
+
+
+# ---- whole-tree snapshot with a persistent reuse manifest (Bash) ----------
+
+def manifest_path(base: str, session: str) -> str:
+    return os.path.join(base, "manifests", _safe_session(session) + ".json")
+
+
+def load_manifest(base: str, session: str) -> Dict[str, Dict]:
+    path = manifest_path(base, session)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with safe_store_read(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_manifest(base: str, session: str, manifest: Dict[str, Dict]) -> None:
+    path = manifest_path(base, session)
+    tmp = "{0}.{1}.{2}.tmp".format(path, os.getpid(), os.urandom(6).hex())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+
+def snapshot_tree(base: str, cwd: str, salt: bytes,
+                  session: str) -> Dict[str, Optional[Dict]]:
+    """Whole-worktree snapshot, but reuse the prior snapshot's record for any file
+    whose (mtime_ns, ctime_ns, size) is unchanged -- so unchanged files are NOT
+    re-read or re-hashed. The first call is cold (O(N) read); later calls are
+    O(N stat + changed-files read), which is the realistic case across the many
+    Bash commands of a session.
+
+    Why ctime in the key (not just mtime+size): a content rewrite that forges
+    mtime (touch -r / cp -p) still bumps ctime, so a stale record can't be reused
+    for a changed file -- the reuse stays as safe as a full re-hash for any real
+    write. The cache only ever SAVES a read; every entry is re-validated by stat.
+    """
+    manifest = load_manifest(base, session)
+    snap: Dict[str, Optional[Dict]] = {}
+    new_manifest: Dict[str, Dict] = {}
+    for ap in walk_worktree(cwd, base):
+        disp = rel_to_cwd(cwd, ap)
+        # Key the cache by ABSOLUTE path, not the cwd-relative display path: one
+        # session can span multiple cwds with a shared store, and two distinct
+        # files at the same relative path (projA/VERSION vs projB/VERSION) would
+        # otherwise collide and reuse the wrong file's hash on a stat tie.
+        mkey = os.path.abspath(ap)
+        try:
+            st = os.lstat(ap)
+        except OSError:
+            continue
+        key = [st.st_mtime_ns, st.st_ctime_ns, st.st_size]
+        cached = manifest.get(mkey)
+        # RACY-CLEAN guard (git's mitigation): on a COARSE-granularity filesystem
+        # (whole-second mtime/ctime -- legacy ext4 128-byte inodes, many NFS/SMB/FAT
+        # mounts), a same-size write that lands in the same tick as the prior snapshot
+        # leaves (mtime, ctime, size) unchanged, so the stat key wrongly says
+        # "unchanged" and a real modification (and any secret it wrote) is dropped as
+        # 'read'. The signal is a timestamp with NO sub-second component; when we see
+        # it, don't trust the key -- re-hash. On a nanosecond-resolution FS this is
+        # virtually never set, so the reuse cache stays fully effective.
+        racy = (st.st_mtime_ns % 1_000_000_000 == 0
+                or st.st_ctime_ns % 1_000_000_000 == 0)
+        # Reuse only a structurally-complete rec (require "sha"): a corrupted or
+        # old-schema on-disk manifest must fall through to a fresh read, not be
+        # trusted as a content-less {} (which would drop the file silently).
+        if (not racy and isinstance(cached, dict) and cached.get("key") == key
+                and isinstance(cached.get("rec"), dict) and "sha" in cached["rec"]):
+            rec = cached["rec"]                       # unchanged -> reuse, no read
+        else:
+            rec = snapshot_file(base, ap, salt, path_is_sensitive(ap, disp, cwd),
+                                is_sniff_exempt(disp))
+        snap[disp] = rec
+        new_manifest[mkey] = {"key": key, "rec": rec}
+    save_manifest(base, session, new_manifest)
+    return snap
+
+
+# ---- per-session lock (serialize a session's hook events) ----------------
+
+def _safe_session(session) -> str:
+    """Filesystem-safe, INJECTIVE session name. Replacing '/'->'_' alone collided
+    ('a/b' and 'a_b' mapped to one file and shared state); we append a short hash
+    whenever any character is rewritten (or the result is empty/dot) so distinct
+    sessions never share a pending stack / ndjson. Pure [A-Za-z0-9_.-] names (e.g.
+    UUID session ids) are left untouched for readable filenames.
+
+    Tolerant of a malformed session_id: a non-string (int/list) is coerced via str()
+    -- re.sub would otherwise raise TypeError -- and the hash encodes with
+    'surrogatepass' so a lone-surrogate id (which survives json.loads, e.g.
+    "\\ud800abc") doesn't raise UnicodeEncodeError. Either failure would be swallowed
+    by main()'s fail-open guard and silently drop EVERY event for that session, since
+    this name is on the lock/pending/ndjson/manifest/cursor path.
+
+    A coerced non-string ALWAYS takes the disambiguating-hash branch, so int 1 and
+    str "1" (both stringify to "1") never collide onto one session file -- the
+    injectivity the hash exists to guarantee."""
+    coerced = not isinstance(session, str)
+    if coerced:
+        session = str(session) if session is not None else "default"
+    s = session or "default"
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", s)
+    if coerced or safe != s or safe in ("", ".", ".."):
+        base_name = safe if safe not in ("", ".", "..") else "s"
+        digest = hashlib.sha256(s.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+        safe = base_name + "-" + digest
+    return safe
+
+
+# Bound the wait for the per-session lock. A blocking flock(LOCK_EX) would park the
+# hook forever if a same-session holder wedges (stalled I/O, slow NFS), and main()'s
+# try/except cannot fail open on a thread parked in the syscall. With a deadline we
+# retry LOCK_NB and, on timeout, raise (caught by main -> return 0), skipping this one
+# event (logged via log_internal) rather than stalling the agent's tool pipeline. Kept
+# short: real contention is sub-second, so a multi-second wait means a wedged holder.
+LOCK_ACQUIRE_TIMEOUT = 10.0
+
+
+@contextlib.contextmanager
+def session_lock(base: str, session: str):
+    safe = _safe_session(session)
+    path = os.path.join(base, "locks", safe + ".lock")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | _SAFE_STORE_OPEN, 0o600)
+    acquired = False
+    try:
+        deadline = time.monotonic() + LOCK_ACQUIRE_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    log_internal("session lock busy {0}; dropping event".format(safe))
+                    raise TimeoutError("session lock busy: " + safe)
+                time.sleep(0.02)
+        yield
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+# ---- pending stack (Pre -> Post correlation) -----------------------------
+
+def pending_path(base: str, session: str) -> str:
+    return os.path.join(base, "pending", _safe_session(session) + ".json")
+
+
+def _load_stack(path: str) -> List[Dict]:
+    if not os.path.exists(path):
+        return []
+    try:
+        with safe_store_read(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        log_internal("pending not a list; resetting")
+        return []
+    return [r for r in data if isinstance(r, dict)]
+
+
+def _write_stack(path: str, stack: List[Dict]) -> None:
+    # Per-writer tmp name (pid+random), matching store_blob/save_manifest: on a
+    # filesystem where flock is advisory-ignored (some NFS/SMB), two same-session
+    # writers would otherwise share one fixed `.tmp` inode and interleave writes.
+    tmp = "{0}.{1}.{2}.tmp".format(path, os.getpid(), os.urandom(6).hex())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(stack, fh)
+        os.replace(tmp, path)
+    finally:
+        # Remove a partial tmp if json.dump failed mid-write (ENOSPC/EIO) before the
+        # replace -- mirrors save_manifest/store_blob so no stray .tmp is left behind.
+        with contextlib.suppress(OSError):
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+
+def list_pending(base: str, session: str) -> List[Dict]:
+    """The still-open Pre records for a session (Pres without a Post yet)."""
+    return _load_stack(pending_path(base, session))
+
+
+def push_pending(base: str, session: str, record: Dict) -> None:
+    path = pending_path(base, session)
+    stack = _load_stack(path)
+    stack.append(record)
+    # Evict stale orphan Pres so a stream of denied/aborted tools can't grow the
+    # stack forever. TTL is skipped under a frozen clock (all ts equal); the
+    # length cap always applies.
+    now = record.get("ts")
+    if now and not os.environ.get("ALOG_FROZEN_CLOCK"):
+        stack = [r for r in stack
+                 if (now - (r.get("ts") or now)) <= PENDING_TTL_SECONDS]
+    if len(stack) > MAX_PENDING:
+        stack = stack[-MAX_PENDING:]
+    _write_stack(path, stack)
+
+
+def pop_pending(base: str, session: str, tool: str,
+                file_path: Optional[str],
+                tool_use_id: Optional[str] = None) -> Optional[Dict]:
+    """Pop the Pre record matching this Post, or None if there is no match.
+
+    Correlation is by ``tool_use_id`` -- the per-invocation id that Claude Code
+    puts on BOTH the Pre and the Post of one tool call. Exact-id matching is what
+    makes parallel / interleaved tool calls correct: the old tool(+file_path)
+    LIFO scan would, under interleaving, pop a DIFFERENT invocation's Pre and so
+    pair a wrong 'before' with this 'after' (fabricated diffs), and an orphaned
+    Bash Pre could be popped by a later single-file Post (fabricated deletions).
+
+    A Post whose id has no pending Pre is a genuine orphan (e.g. the Pre hook
+    never ran); we return None so the event degrades to 'before unknown' rather
+    than stealing an unrelated Pre. Payloads without an id fall back to the
+    original tool(+file_path) LIFO for backward compatibility.
+    """
+    path = pending_path(base, session)
+    stack = _load_stack(path)
+    if not stack:
+        return None
+
+    idx = None
+    if tool_use_id:
+        for j in range(len(stack) - 1, -1, -1):
+            # Cross-validate the TOOL, not just the id: a same-id / different-tool
+            # pairing (payload corruption, a reused/duplicated id, or a crafted
+            # payload) would fabricate a confident wrong diff -- e.g. a Bash 'after'
+            # against an Edit 'before'. Claude Code always puts the same id+tool on a
+            # call's Pre and Post, so requiring both is exact, never lossy.
+            if stack[j].get("id") == tool_use_id and stack[j].get("tool") == tool:
+                idx = j
+                break
+    else:
+        def matches(rec: Dict) -> bool:
+            # An id-tracked Pre is claimable ONLY by its own id: an id-less Post must
+            # never hijack it via the legacy LIFO scan (that would steal a different
+            # in-flight invocation's 'before' and strand its real Post).
+            if rec.get("id"):
+                return False
+            if rec.get("tool") != tool:
+                return False
+            if tool in SINGLE_FILE_TOOLS:
+                return rec.get("file_path") == file_path
+            return True
+
+        # Bash (no file_path) matches purely on tool, so a LIFO scan with two open
+        # Bash Pres would pop the NEWEST regardless of which command is posting,
+        # pairing a wrong before-snapshot. For Bash prefer the OLDEST open Pre (FIFO)
+        # -- a closer approximation to real completion order on the legacy no-id path.
+        # Single-file tools keep LIFO (their file_path disambiguates exactly).
+        if tool == "Bash" and file_path is None:
+            for j in range(len(stack)):           # FIFO: oldest matching Bash first
+                if matches(stack[j]):
+                    idx = j
+                    break
+        else:
+            for j in range(len(stack) - 1, -1, -1):  # LIFO scan
+                if matches(stack[j]):
+                    idx = j
+                    break
+    if idx is None:
+        return None
+    record = stack.pop(idx)
+    _write_stack(path, stack)
+    return record
+
+
+# ---- event assembly ------------------------------------------------------
+
+def session_file(base: str, session: str) -> str:
+    return os.path.join(base, "sessions", _safe_session(session) + ".ndjson")
+
+
+def _append_event(base: str, session: str, event: Dict) -> None:
+    """Append one event as an NDJSON line, creating the session file 0600.
+
+    0600 (not the umask-inherited 0644) honours the DESIGN store-permission
+    invariant: the log can hold command strings / prompts and must not be
+    world-readable.
+    """
+    # A non-UTF-8 filename (os.walk decodes it with surrogateescape) becomes a lone
+    # surrogate in the event; json.dumps(ensure_ascii=False) keeps it, and encoding
+    # that to UTF-8 raises -- which used to lose the ENTIRE event (all its changes),
+    # not just the bad path. Probe the encode first and fall back to the ASCII-escaped
+    # form (\uXXXX), which is pure ASCII -> always writable AND readable strict-UTF-8.
+    try:
+        line = json.dumps(event, ensure_ascii=False)
+        line.encode("utf-8")
+    except (UnicodeEncodeError, ValueError, TypeError):
+        line = json.dumps(event, ensure_ascii=True)
+    fd = os.open(session_file(base, session),
+                 os.O_WRONLY | os.O_CREAT | os.O_APPEND | _SAFE_STORE_OPEN, 0o600)
+    # Self-heal perms: O_CREAT's mode only applies on CREATE, so an existing log
+    # loosened by a previous run / umask reset / mode-preserving copy would stay
+    # world-readable. The log can hold command strings + prompts -> keep it 0600.
+    with contextlib.suppress(OSError):
+        os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def read_session_events(base: str, session: str) -> List[Dict]:
+    """All recorded events for a session (best-effort; skips malformed lines)."""
+    path = session_file(base, session)
+    out: List[Dict] = []
+    if not os.path.exists(path):
+        return out
+    # errors="replace": a torn multibyte tail from a SIGKILL'd mid-append must skip
+    # one line, not raise UnicodeDecodeError and permanently disable turn capture for
+    # the session (the write path already ASCII-escapes; keep the read symmetric).
+    try:
+        with safe_store_read(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
+    except OSError:                 # store node swapped (FIFO/symlink) -- degrade
+        return out
+    return out
+
+
+def read_session_events_after(base: str, session: str, after_seq: int) -> List[Dict]:
+    """Events with seq > after_seq, read from the file TAIL so a Bash Post's
+    concurrency scan is O(window) instead of O(whole session) on every call.
+
+    Reads a 64KiB tail; if that window reaches back to (after_seq) the result is
+    complete (events are appended in ascending seq), otherwise it falls back to a
+    full scan for correctness (rare: only with very large events in the window).
+    """
+    path = session_file(base, session)
+    if not os.path.exists(path):
+        return []
+    try:
+        with safe_store_read(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 65536))
+            tail = fh.read()
+    except OSError:                 # store node swapped (FIFO/symlink) -- degrade
+        return []
+    lines = tail.split(b"\n")
+    if size > 65536:
+        lines = lines[1:]                      # drop the leading partial line
+    events, seqs = [], []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        s = ev.get("seq")
+        if isinstance(s, int):
+            seqs.append(s)
+            if s > after_seq:
+                events.append(ev)
+    # The window is complete iff we read from the start, or it contains an event
+    # at/below the boundary (so no overlap event lies before the window).
+    reaches = size <= 65536 or (seqs and min(seqs) <= after_seq + 1)
+    if reaches:
+        return events
+    return [e for e in read_session_events(base, session)
+            if isinstance(e.get("seq"), int) and e["seq"] > after_seq]
+
+
+def next_seq(base: str, session: str) -> int:
+    """Next monotonic seq. Reads only the file's tail (last line) so it is O(1)
+    per call instead of O(N) -- a long session otherwise made each Post O(N) and
+    the whole session O(N^2)."""
+    path = session_file(base, session)
+    if not os.path.exists(path):
+        return 1
+    try:
+        with safe_store_read(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if size == 0:
+                return 1
+            fh.seek(max(0, size - 65536))
+            tail = fh.read()
+    except OSError:                 # store node swapped -- try the full scan below
+        tail = b""
+    for line in reversed(tail.split(b"\n")):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        seq = obj.get("seq") if isinstance(obj, dict) else None
+        if isinstance(seq, int):
+            return seq + 1
+        # A type-corrupt / non-dict line: keep scanning back for a valid one
+        # rather than abandoning to the fallback (`continue`, not `break`).
+        continue
+    # Fallback: the tail had no parseable integer seq (e.g. a single line longer
+    # than the 64KiB window). Scan the whole file for the LAST valid seq -- using
+    # the line COUNT would be wrong whenever seq diverges from the line number.
+    last = 0
+    try:
+        with safe_store_read(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                seq = obj.get("seq") if isinstance(obj, dict) else None
+                if isinstance(seq, int):
+                    last = seq
+    except OSError:                 # store node swapped (FIFO/symlink) -- degrade
+        return last + 1
+    return last + 1
+
+
+def build_changes(before: Dict[str, Optional[Dict]],
+                  after: Dict[str, Optional[Dict]],
+                  had_before: bool,
+                  named: Optional[str],
+                  is_bash: bool = False,
+                  concurrent: Optional[List[Dict]] = None,
+                  read_only: bool = False) -> List[Dict]:
+    """Diff two snapshot maps into per-path change records.
+
+    `named` is the single display path a single-file tool targeted; it is always
+    reported even if absent both sides (e.g. a Read of a secret that isn't there
+    -- a notable access attempt). `had_before` False means there was no Pre, so
+    we cannot claim 'added' vs 'modified': such files are reported 'present'.
+
+    For a Bash event, `concurrent` is the set of OTHER tools whose Pre window was
+    still open -- any change here may have been produced by one of them rather
+    than by this command, so each Bash change is tagged with an `attribution`
+    (exclusive / ambiguous / claimed_by_concurrent) for honest reporting.
+    """
+    concurrent = concurrent or []
+    concurrent_paths = {c.get("file_path") for c in concurrent if c.get("file_path")}
+    has_concurrent = bool(concurrent)
+    changes = []
+    paths = set(before) | set(after)
+    if named:
+        paths.add(named)
+    for path in sorted(paths):
+        b = before.get(path)
+        a = after.get(path)
+        b_exists = b is not None
+        a_exists = a is not None
+        b_sha = b.get("sha") if b else None
+        a_sha = a.get("sha") if a else None
+        b_large = bool(b and b.get("toolarge"))
+        a_large = bool(a and a.get("toolarge"))
+        b_unread = bool(b and b.get("unreadable"))
+        a_unread = bool(a and a.get("unreadable"))
+        # Content-unavailable: too-large or unreadable. Both carry sha=None, so a
+        # real change would otherwise tie on sha and hide as 'read'.
+        unavailable = b_large or a_large or b_unread or a_unread
+        redacted = bool((b and b.get("redacted")) or (a and a.get("redacted")))
+        b_nonreg = bool(b and b.get("kind") == "non-regular")
+        a_nonreg = bool(a and a.get("kind") == "non-regular")
+
+        def _meta(rec_, key):
+            return rec_.get(key) if rec_ else None
+
+        if not b_exists and not a_exists:
+            if path != named:
+                continue
+            status = "missing"          # named secret/file not present
+        elif b_exists and a_exists and b_nonreg != a_nonreg:
+            status = "typechange"       # regular <-> non-regular (a file replaced by
+                                        # a symlink, or a symlink made a real file)
+        elif not had_before and a_exists:
+            status = "present"          # before unknown; cannot call it added
+        elif b_exists and a_exists and b_sha == a_sha:
+            # Equal shas usually mean 'unchanged access'. For content-unavailable
+            # files fall back to size/mtime/ctime (ctime catches a rewrite that
+            # forged mtime) so a real change isn't silently reported as 'read'.
+            # For two non-regular records (both sha=None), a symlink REPOINTED in
+            # place keeps its kind but changes link_target/mtime/ctime -- compare
+            # those so the retarget surfaces as 'modified', not a phantom 'read'.
+            nonreg_changed = b_nonreg and a_nonreg and (
+                _meta(b, "link_target") != _meta(a, "link_target")
+                or _meta(b, "mtime") != _meta(a, "mtime")
+                or _meta(b, "ctime") != _meta(a, "ctime"))
+            # A pure permission change (chmod +x deploy.sh) leaves content -- and so
+            # the sha -- identical, but IS a real, security-relevant modification that
+            # git records. Surface it as 'modified' with a mode-change annotation.
+            b_mode = _meta(b, "mode")
+            a_mode = _meta(a, "mode")
+            mode_changed = (b_mode is not None and a_mode is not None
+                            and b_mode != a_mode)
+            if nonreg_changed:
+                status = "modified"
+            elif mode_changed:
+                status = "modified"
+            elif unavailable and (
+                    _meta(b, "size") != _meta(a, "size")
+                    or _meta(b, "mtime") != _meta(a, "mtime")
+                    or _meta(b, "ctime") != _meta(a, "ctime")):
+                status = "modified"
+            else:
+                status = "read"         # observed but unchanged == an access
+        elif not b_exists and a_exists:
+            status = "added"
+        elif b_exists and not a_exists:
+            status = "deleted"
+        else:
+            status = "modified"
+
+        # A READ-ONLY tool (Read) cannot author a change: a content difference between
+        # its Pre and Post snapshots is an EXTERNAL/concurrent write, not the Read's
+        # doing. Record it as a 'read' access with an external-change marker rather
+        # than falsely attributing authorship (`read MODIFIED ...`).
+        external_change = False
+        if read_only and status in ("added", "modified", "deleted", "typechange"):
+            external_change = True
+            status = "read"
+
+        # A symlink whose resolved target is sensitive (alias.txt -> .env) carries
+        # target_sensitive from _nonregular_rec: OR it in so the aliased secret access
+        # surfaces in the audit even though the link's own name isn't sensitive.
+        target_sensitive = bool((b and b.get("target_sensitive"))
+                                or (a and a.get("target_sensitive")))
+        rec = {
+            "path": path,
+            "status": status,
+            "before": b_sha,
+            "after": a_sha,
+            # `redacted` (content withheld) is ORed in so the field is consistent with
+            # the abspath-based withhold decision (a .ssh/config sensitive only by a
+            # segment above cwd is redacted=True; is_sensitive(relative path) is False).
+            "sensitive": is_sensitive(path) or target_sensitive or redacted,
+            "redacted": redacted,
+        }
+        if external_change:
+            rec["external_change"] = True
+        # Annotate a permission-only change (content unchanged) so the reader can
+        # show `chmod`-style mode transitions instead of an opaque 'modified'.
+        if (b_sha == a_sha and _meta(b, "mode") is not None
+                and _meta(a, "mode") is not None
+                and _meta(b, "mode") != _meta(a, "mode")):
+            rec["mode_change"] = [_meta(b, "mode"), _meta(a, "mode")]
+        if unavailable:
+            # The renderer must print a notice instead of diffing against an empty
+            # blob (which fabricated a full deletion when 'after' was unreadable).
+            rec["content_unavailable"] = "large" if (b_large or a_large) else "unreadable"
+            rec["before_size"] = _meta(b, "size")
+            rec["after_size"] = _meta(a, "size")
+            if b_large or a_large:
+                rec["large"] = True
+        if is_bash:
+            if path in concurrent_paths:
+                rec["attribution"] = "claimed_by_concurrent"
+            elif has_concurrent:
+                rec["attribution"] = "ambiguous"
+            else:
+                rec["attribution"] = "exclusive"
+        changes.append(rec)
+    return changes
+
+
+def _snapshot(base: str, tool: str, tool_input: Dict, cwd: str, salt: bytes,
+              session: str) -> Dict[str, Optional[Dict]]:
+    """Bash snapshots the whole tree (manifest-cached); single-file tools snapshot
+    just their named path (always fresh -- it is one file, so no cache needed)."""
+    if tool == "Bash":
+        return snapshot_tree(base, cwd, salt, session)
+    return snapshot_set(base, files_of_interest(tool, tool_input, cwd), cwd, salt)
+
+
+def handle_pre(base: str, payload: Dict, tool: str, cwd: str, salt: bytes,
+               tool_use_id: Optional[str] = None) -> None:
+    session = payload.get("session_id", "default")
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):   # a truthy non-dict (list/str/int) would
+        tool_input = {}                    # raise on .get() and silently drop the event
+    fp = named_file_path(tool, tool_input, cwd)
+    # Capture the seq boundary BEFORE the before-snapshot, not after acquiring the
+    # lock: a concurrent tool that POSTs during the snapshot or while we block on the
+    # lock would otherwise fall OUTSIDE the window (seq <= nseq) and also be gone from
+    # pending, so its write -- absent from `before` but present in a later Bash's
+    # `after` -- got a false 'exclusive'. Capturing early OVER-includes such events
+    # (they land in the window -> honest 'ambiguous'), which is the safe direction.
+    nseq_at_pre = next_seq(base, session) - 1
+    # Snapshot OUTSIDE the lock (see handle_post): the whole-tree Bash walk is
+    # O(tree) and must not hold the per-session lock while it runs.
+    before = _snapshot(base, tool, tool_input, cwd, salt, session)
+    with session_lock(base, session):
+        push_pending(base, session, {
+            "id": tool_use_id,
+            "tool": tool,
+            "file_path": rel_to_cwd(cwd, fp) if fp else None,
+            "ts": now_ts(base),
+            # Number of events already written when this Pre fired (captured before
+            # the snapshot). A later Bash uses it to find tools that POSTED in its
+            # window.
+            "nseq_at_pre": nseq_at_pre,
+            "before": before,
+        })
+
+
+def handle_post(base: str, payload: Dict, tool: str, cwd: str, salt: bytes,
+                tool_use_id: Optional[str] = None, failed: bool = False) -> None:
+    session = payload.get("session_id", "default")
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):   # a truthy non-dict (list/str/int) would
+        tool_input = {}                    # raise on .get() and silently drop the event
+    fp = named_file_path(tool, tool_input, cwd)
+    named = rel_to_cwd(cwd, fp) if fp else None
+
+    command = tool_input.get("command") if tool == "Bash" else None
+    if not isinstance(command, str):
+        command = None
+    cmd_sensitive = scan_cmd_for_secrets(command, cwd) if command else []
+
+    # Snapshot OUTSIDE the lock: the whole-tree Bash walk is O(tree) and used to
+    # hold the per-session lock, serializing every other concurrent tool hook in the
+    # session. The lock now guards only the fast pending/seq/log mutations below; the
+    # manifest cache uses atomic os.replace, so concurrent snapshots are safe (a lost
+    # cache write just forces a re-read, never a wrong result).
+    after = _snapshot(base, tool, tool_input, cwd, salt, session)
+    with session_lock(base, session):
+        pending = pop_pending(base, session, tool, named, tool_use_id)
+        before = pending.get("before", {}) if pending else {}
+        ts_pre = pending.get("ts") if pending else None
+        matched_pre_id = pending.get("id") if pending else None
+        # A Bash command snapshots the whole tree; a change it observed may have
+        # been produced by a CONCURRENT tool, not the command. Two overlap classes:
+        #   (1) other tools whose Pre is still open (this Bash's own Pre was just
+        #       popped above, so list_pending holds only OTHERS -- no id filter
+        #       needed, which also fixes the id==None false-exclude bug).
+        #   (2) single-file tools that POSTED *after* this Bash's Pre fired, i.e.
+        #       finished inside the window. Detected via event seq (monotonic,
+        #       frozen-clock safe) so a fast Edit that completes before the Bash
+        #       Post is no longer misattributed to the command.
+        concurrent: List[Dict] = []
+        if tool == "Bash":
+            for r in list_pending(base, session):
+                # A still-open Pre is UNCONFIRMED -- the tool has not posted, so it may
+                # never author anything (a user-rejected/aborted Edit leaves an orphan
+                # Pre that lingers for hours). It must NOT CLAIM its file_path: doing so
+                # stamped a later genuine Bash write to that path 'claimed_by_concurrent'
+                # and the audit then dropped the real secret write entirely. An open Pre
+                # only makes this command's attribution 'ambiguous' (file_path=None);
+                # authorship is confirmed solely by POSTED events (the posted-overlap
+                # branch below). Read-only Pres don't even warrant ambiguity.
+                if r.get("tool") in READ_ONLY_TOOLS:
+                    continue
+                concurrent.append({"id": r.get("id"), "tool": r.get("tool"),
+                                   "file_path": None, "via": "open-pre"})
+            pre_count = pending.get("nseq_at_pre") if pending else None
+            if isinstance(pre_count, int):
+                # Only the events that POSTED after this Bash's Pre (seq>pre_count)
+                # can overlap -- read just that tail, not the whole session.
+                for ev in read_session_events_after(base, session, pre_count):
+                    ev_tool = ev.get("tool")
+                    # WRITE_TOOLS excludes Read: a concurrent Read of the same path
+                    # is read-only, so a Bash write to it stays this command's (never
+                    # claimed_by_concurrent). Only change-authoring tools can claim --
+                    # and only if the Write actually AUTHORED that path. A no-op Write
+                    # (wrote identical bytes -> its own change status is 'read') must
+                    # NOT claim, else it disowns THIS command's real write to the path.
+                    if ev_tool in WRITE_TOOLS and ev.get("file_path"):
+                        wfp = ev.get("file_path")
+                        # Claim the path ONLY if the Write both AUTHORED it (its own
+                        # change status is added/modified/deleted -- a no-op 'read'
+                        # write must not claim) AND its change is SENSITIVE/REDACTED.
+                        # A BENIGN Write that claims a path can't be relied on to
+                        # report a secret access: if this Bash wrote a secret to the
+                        # same path, claiming would suppress it from the audit with
+                        # nothing else reporting it (false all-clear). When the Write
+                        # is benign, leave the overlap ambiguous instead.
+                        # ...AND the Write's FINAL state for wfp equals THIS Bash's
+                        # after-state (same after-sha). If they differ, the Bash wrote
+                        # a DIFFERENT value than the Write (each authored a distinct
+                        # state), so the Write's event does not report the Bash's write
+                        # -- suppressing it would hide a real (possibly secret) change.
+                        bash_after_sha = (after.get(wfp) or {}).get("sha") if after.get(wfp) else None
+                        claim = any(
+                            c.get("path") == wfp
+                            and c.get("status") in (
+                                "added", "modified", "deleted", "typechange")
+                            and (c.get("redacted") or c.get("sensitive"))
+                            and c.get("after") == bash_after_sha
+                            for c in (ev.get("changes") or []) if isinstance(c, dict))
+                        concurrent.append({"id": ev.get("tool_use_id"),
+                                           "tool": ev_tool,
+                                           "file_path": wfp if claim else None,
+                                           "via": "posted-overlap"})
+                    elif ev_tool == "Bash":
+                        # A CONCURRENT Bash that finished inside our window. It ALSO
+                        # snapshots the whole tree, so a 'modified'/'added'/'deleted'
+                        # entry in ITS diff is NOT proof it authored that path -- the
+                        # tree merely changed during its window, which may be THIS
+                        # command's own write. So never CLAIM a specific path from a
+                        # concurrent Bash (that would disown the real author): record
+                        # the overlap with no path, which honestly downgrades all of
+                        # THIS command's changes to 'ambiguous' rather than a false
+                        # 'exclusive'. (A single-file WRITE tool, by contrast, has a
+                        # definite target, so it still claims its path above.)
+                        concurrent.append({"id": ev.get("tool_use_id"),
+                                           "tool": "Bash", "file_path": None,
+                                           "via": "posted-bash-overlap"})
+        changes = build_changes(before, after, pending is not None, named,
+                                tool == "Bash", concurrent,
+                                read_only=tool in READ_ONLY_TOOLS)
+
+        event = {
+            "seq": next_seq(base, session),
+            "session": session,
+            "tool": tool,
+            "tool_use_id": tool_use_id,
+            "matched_pre_id": matched_pre_id,
+            "ts_pre": ts_pre,
+            "ts": now_ts(base),
+            "had_before": pending is not None,
+            "outcome": "failure" if failed else "success",
+            "cwd": cwd,
+            "command": redact_command(command) if command else None,
+            "file_path": named,
+            "changes": changes,
+            "cmd_sensitive": cmd_sensitive,
+            "concurrent": concurrent,
+        }
+        _append_event(base, session, event)
+
+
+# ---- prompt / token capture (non-tool events) ----------------------------
+
+def _tok_int(usage: Dict, key: str) -> int:
+    """A usage field as a non-negative int, tolerant of junk in the transcript.
+
+    Rejects: bool ('true' is not 1 token -- bool is an int subclass), NaN/Infinity
+    (json.loads accepts these by default, and 1e400 overflows to inf; int(nan)
+    raises ValueError, int(inf) raises OverflowError), and non-numeric values.
+    """
+    v = usage.get(key)
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, int):
+        return max(0, v)       # clamp: a negative token count would invert the
+    if isinstance(v, float) and math.isfinite(v):   # session's cost total
+        return max(0, int(v))
+    return 0
+
+
+def parse_transcript_turns(path: str, start_offset: int = 0) -> Tuple[List[Dict], int]:
+    """One usage record per DISTINCT assistant message.id in a Claude Code
+    transcript (JSONL), reading only the bytes at/after ``start_offset``.
+
+    A single assistant message is written to the transcript once PER content
+    block (thinking / text / tool_use), and every one of those lines repeats the
+    SAME ``usage`` object -- so summing lines would multiply a turn's tokens by
+    its block count (observed: 44 lines -> 19 ids on a real session). We dedupe
+    by ``message.id`` (first occurrence wins).
+
+    Returns ``(turns, new_offset)`` where ``new_offset`` is the byte position
+    after the last COMPLETE line consumed; a trailing partial line (a torn write
+    while another process is mid-flush) is left unconsumed so it is re-read next
+    call. Passing ``new_offset`` back on the next Stop means a growing transcript
+    is read once, not O(N) per Stop.
+
+    Never raises (honours the hook's "never break the agent" contract): the file
+    is read as BYTES and decoded per-line inside ``json.loads``, so a truncated
+    multi-byte char at EOF is a caught ``ValueError`` (``UnicodeDecodeError``
+    subclass), not an escaping exception; a missing file yields ``([], offset)``.
+    """
+    turns: Dict[str, Dict] = {}
+    order: List[str] = []
+    # Open O_NONBLOCK|O_NOFOLLOW and re-check S_ISREG AFTER the open, not before: the
+    # handle_stop lstat guard is a check-then-open TOCTOU -- if the path is swapped to
+    # a FIFO in that window, a plain blocking open() would park forever. O_NONBLOCK
+    # returns immediately even for a writer-less FIFO; the fstat then rejects it.
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return [], start_offset
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                return [], start_offset
+            # Clamp the cursor to the current size: if the transcript was truncated or
+            # rotated shorter than the saved offset, seeking past EOF would read b""
+            # forever and freeze the cursor high, silently under-counting turns. Reset
+            # to 0 on a shrink (the recorded_turn_ids gate prevents double-counting).
+            size = st.st_size
+            start = start_offset if 0 < start_offset <= size else 0
+            fh.seek(start)
+            # BOUNDED read: never slurp a whole huge/swapped transcript into memory
+            # (a 10GB file would MemoryError -> caught fail-open, but risks an OS OOM
+            # SIGKILL that breaks the agent). Read a chunk; the cursor advances by the
+            # complete lines consumed, so the remainder is picked up on the next Stop.
+            data = fh.read(MAX_TRANSCRIPT_READ)
+    except OSError:
+        return [], start_offset
+    # The element after the final b"\n" is a trailing PARTIAL line (no terminator
+    # yet); drop it and do NOT advance the offset past it, so a mid-flush final
+    # line is re-read next time rather than parsed half-written.
+    parts = data.split(b"\n")
+    consumed = 0
+    for raw in parts[:-1]:
+        consumed += len(raw) + 1          # +1 for the split-off b"\n"
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)        # bytes ok; UnicodeDecodeError is a ValueError
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        mid = msg.get("id")
+        if not isinstance(mid, str) or not mid or mid in turns:
+            continue
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        turns[mid] = {
+            "message_id": mid,
+            "model": msg.get("model") if isinstance(msg.get("model"), str) else None,
+            "input_tokens": _tok_int(usage, "input_tokens"),
+            "output_tokens": _tok_int(usage, "output_tokens"),
+            "cache_creation_input_tokens": _tok_int(usage, "cache_creation_input_tokens"),
+            "cache_read_input_tokens": _tok_int(usage, "cache_read_input_tokens"),
+        }
+        order.append(mid)
+    # A single line longer than the read cap would never yield a complete line
+    # (consumed stays 0 while the window is full), stranding the cursor forever.
+    # Skip past that pathological line so progress resumes on the next Stop.
+    if consumed == 0 and len(data) >= MAX_TRANSCRIPT_READ:
+        return [], start + MAX_TRANSCRIPT_READ
+    return [turns[m] for m in order], start + consumed
+
+
+def recorded_turn_ids(base: str, session: str) -> Set[str]:
+    """message_ids already written as ``turn`` events for this session -- the
+    dedup GATE that keeps the log the single source of truth for what is recorded.
+
+    The transcript read cursor (below) is only an I/O hint to avoid re-reading old
+    bytes; this gate is what actually guarantees no double count, so a missing or
+    stale cursor costs at most a re-read, never a duplicate. Reads the compact
+    per-session metadata log (not the transcript)."""
+    ids: Set[str] = set()
+    for ev in read_session_events(base, session):
+        if ev.get("kind") == "turn":
+            mid = ev.get("message_id")
+            if mid:
+                ids.add(mid)
+    return ids
+
+
+def _cursor_path(base: str, session: str) -> str:
+    return os.path.join(base, "cursors", _safe_session(session) + ".json")
+
+
+def read_cursor(base: str, session: str) -> int:
+    """Transcript byte offset already processed for this session (0 if none)."""
+    try:
+        with safe_store_read(_cursor_path(base, session), "r", encoding="utf-8") as fh:
+            obj = json.loads(fh.read() or "{}")
+    except (OSError, ValueError):
+        return 0
+    off = obj.get("offset") if isinstance(obj, dict) else None
+    return off if isinstance(off, int) and off >= 0 else 0
+
+
+def write_cursor(base: str, session: str, offset: int) -> None:
+    """Persist the processed transcript offset (0600). Best-effort I/O hint."""
+    fd = os.open(_cursor_path(base, session),
+                 os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _SAFE_STORE_OPEN, 0o600)
+    with contextlib.suppress(OSError):   # self-heal an existing cursor's perms
+        os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"offset": int(offset)}))
+
+
+def handle_user_prompt(base: str, payload: Dict) -> None:
+    """Record the user's prompt (UserPromptSubmit) as a ``prompt`` event."""
+    session = payload.get("session_id", "default")
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return
+    with session_lock(base, session):
+        _append_event(base, session, {
+            "seq": next_seq(base, session),
+            "session": session,
+            "kind": "prompt",
+            "ts": now_ts(base),
+            "prompt": redact_prompt(prompt),
+            "chars": len(prompt),
+        })
+
+
+def handle_stop(base: str, payload: Dict) -> None:
+    """Record per-turn token usage (Stop / SubagentStop) from the session
+    transcript as ``turn`` events. Cost is NOT stored -- alog derives it from the
+    raw token counts and its own price table, so re-pricing needs no re-capture."""
+    session = payload.get("session_id", "default")
+    tpath = payload.get("transcript_path")
+    if not isinstance(tpath, str) or not tpath:
+        return
+    tpath = os.path.expanduser(tpath)
+    # Require a REGULAR file: a symlink is refused (mirrors snapshot_file's discipline)
+    # AND a FIFO / char-device / socket is refused, because parse_transcript_turns does
+    # a blocking open()+read() -- a FIFO with no writer (or /dev/zero) would hang the
+    # Stop hook forever (it runs OUTSIDE the lock, so neither the fail-open try/except
+    # nor the lock deadline bounds it), stalling the agent until the host kills it.
+    try:
+        if not stat.S_ISREG(os.lstat(tpath).st_mode):
+            return
+    except OSError:
+        return
+    # Read the cursor and PARSE the transcript OUTSIDE the per-session lock: the
+    # parse reads and JSON-decodes the whole transcript tail and must not serialize
+    # every other same-session hook behind it (mirrors the snapshot-outside-lock
+    # discipline in handle_pre/handle_post). recorded_turn_ids (taken under the lock
+    # below) is the real dedup GATE, so a concurrent Stop re-reading the same bytes
+    # is harmless -- it just writes nothing.
+    offset = read_cursor(base, session)
+    turns, new_offset = parse_transcript_turns(tpath, offset)
+    with session_lock(base, session):
+        # recorded_turn_ids is the dedup GATE (log = source of truth); the cursor is
+        # only the I/O hint. Advancing the cursor even when nothing new was recorded
+        # skips already-read bytes next time; a write failure just leaves the old
+        # cursor, and the gate prevents any double count on the re-read.
+        seen = recorded_turn_ids(base, session)
+        seq = next_seq(base, session)
+        ts = now_ts(base)
+        for t in turns:
+            if t["message_id"] in seen:
+                continue
+            _append_event(base, session, {
+                "seq": seq,
+                "session": session,
+                "kind": "turn",
+                "ts": ts,
+                "message_id": t["message_id"],
+                "model": t["model"],
+                "input_tokens": t["input_tokens"],
+                "output_tokens": t["output_tokens"],
+                "cache_creation_input_tokens": t["cache_creation_input_tokens"],
+                "cache_read_input_tokens": t["cache_read_input_tokens"],
+            })
+            seq += 1
+        write_cursor(base, session, new_offset)
+
+
+def main() -> int:
+    # Read raw bytes and decode locale-independently: sys.stdin.read() decodes
+    # with the process locale, so under a non-UTF-8 locale (e.g. *.SJIS) an
+    # ordinary non-ASCII UTF-8 payload raises UnicodeDecodeError and crashes the
+    # hook on its first statement -- before the try/except below can fail open.
+    try:
+        # BOUNDED read: cap the payload so a huge (or maliciously large) stdin can't
+        # OOM the hook before the fail-open guards run. A legitimate Write payload
+        # carries the file's content; MAX_PAYLOAD_BYTES is generous for that. An
+        # over-cap payload truncates -> json.loads fails -> return 0 (fail-open).
+        raw = sys.stdin.buffer.read(MAX_PAYLOAD_BYTES + 1).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 -- audit must never break the agent
+        return 0
+    if len(raw) > MAX_PAYLOAD_BYTES:
+        log_internal("payload exceeds {0} bytes; skipping".format(MAX_PAYLOAD_BYTES))
+        return 0
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception as exc:  # noqa: BLE001 -- not just ValueError: a deeply-nested
+        # payload raises RecursionError and an oversized one MemoryError, neither a
+        # ValueError; an unguarded raise here escapes the fail-open contract. Match
+        # the decode guard above and the handler guards below (return 0, never raise).
+        log_internal("bad payload json: {0}".format(exc))
+        return 0
+    if not isinstance(payload, dict):
+        log_internal("payload not an object: {0}".format(type(payload).__name__))
+        return 0
+
+    event_name = payload.get("hook_event_name", "")
+    if not isinstance(event_name, str):   # non-string (e.g. a list) is unhashable:
+        event_name = ""                   # the `in NONTOOL_EVENTS` test would crash
+    # os.path.abspath() calls os.getcwd() internally for a RELATIVE path, and
+    # os.getcwd() raises FileNotFoundError if the hook process's own cwd was deleted.
+    # Both the relative-cwd branch and the getcwd() fallback must be guarded, or an
+    # unguarded raise here (this sits between the two protective try/except blocks)
+    # escapes the fail-open contract and crashes the hook instead of returning 0.
+    raw_cwd = payload.get("cwd")
+    try:
+        if isinstance(raw_cwd, str) and raw_cwd:
+            cwd = os.path.abspath(raw_cwd)
+        else:
+            cwd = os.path.abspath(os.getcwd())
+    except OSError:
+        return 0
+
+    # Non-tool events carry no tool_name: the user prompt and the end-of-turn
+    # token/cost capture. They feed the same per-session NDJSON log but do not
+    # snapshot files (so no salt is needed).
+    if event_name in NONTOOL_EVENTS:
+        try:
+            base = data_dir(cwd)
+            ensure_dirs(base)
+            if event_name == "UserPromptSubmit":
+                handle_user_prompt(base, payload)
+            else:  # Stop / SubagentStop
+                handle_stop(base, payload)
+        except Exception as exc:  # noqa: BLE001 -- audit must never break the agent
+            log_internal("swallowed error: {0!r}".format(exc))
+        return 0
+
+    tool = payload.get("tool_name", "")
+    if not isinstance(tool, str):         # same: a non-string tool_name is
+        tool = ""                         # unhashable and would crash the set test
+    tool_use_id = payload.get("tool_use_id")
+    if not isinstance(tool_use_id, str) or not tool_use_id:
+        # Treat "" like a missing id: an empty id would match nothing yet is
+        # truthy enough to skip the legacy path, stranding the Post.
+        tool_use_id = None
+
+    if tool not in SINGLE_FILE_TOOLS and tool != "Bash":
+        return 0
+
+    try:
+        base = data_dir(cwd)
+        ensure_dirs(base)
+        salt = get_salt(base)
+        if event_name == "PreToolUse":
+            handle_pre(base, payload, tool, cwd, salt, tool_use_id)
+        elif event_name in ("PostToolUse", "PostToolUseFailure"):
+            # PostToolUseFailure fires when a tool FAILS (Bash non-zero, Write/Edit
+            # error). Claude Code sends it INSTEAD of PostToolUse, so a hook that
+            # dispatched only PostToolUse missed every failed call -- and a failed
+            # command that partially wrote files left an orphan Pre and no event, so
+            # its real changes were invisible. Snapshot the after-state either way;
+            # tag the outcome so the reader can show that the tool failed.
+            handle_post(base, payload, tool, cwd, salt, tool_use_id,
+                        failed=(event_name == "PostToolUseFailure"))
+        else:
+            log_internal("ignored event {0}".format(event_name))
+    except Exception as exc:  # noqa: BLE001 -- audit must never break the agent
+        log_internal("swallowed error: {0!r}".format(exc))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
