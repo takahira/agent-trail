@@ -270,6 +270,38 @@ class TestDigests(StoreTestCase):
         self.assertEqual(len(healed), 16)
         self.assertEqual(os.path.getsize(os.path.join(self.base, "salt")), 16)
 
+    def test_concurrent_salt_healers_converge(self):
+        # #3 re-review salt-1: with a TRUNCATED salt (dead creator), many processes
+        # heal at once. Without the store-wide heal lock each os.replace'd its own
+        # salt and returned a DIFFERENT key -> a session's Pre and Post would get
+        # incomparable digests and a false 'modified'. The lock + re-read must make
+        # every healer return the SAME persisted salt.
+        import multiprocessing
+        try:
+            ctx = multiprocessing.get_context("fork")
+        except ValueError:
+            self.skipTest("no fork start method on this platform")
+        base = os.path.join(self.tmp, "healstore", ".alog")
+        hook.ensure_dirs(base)
+        with open(os.path.join(base, "salt"), "wb") as fh:
+            fh.write(b"SHORT")                          # 5-byte truncated salt
+
+        def _worker(b, q):
+            spec = importlib.util.spec_from_file_location("hook", os.path.join(HERE, "hook.py"))
+            m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+            q.put(m.get_salt(b).hex())
+
+        q = ctx.Queue()
+        procs = [ctx.Process(target=_worker, args=(base, q)) for _ in range(12)]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(15)
+        vals = {q.get() for _ in procs}
+        self.assertEqual(len(vals), 1, "concurrent healers diverged: {0}".format(vals))
+        self.assertEqual(len(bytes.fromhex(next(iter(vals)))), 16)
+        self.assertEqual(os.path.getsize(os.path.join(base, "salt")), 16)
+
     def test_salt_extension_change_is_not_hidden(self):
         # #3 T1-1 end-to-end: the salt-extension attack (append a file's prefix to
         # the salt, strip it from the file so digests collide) must surface as a

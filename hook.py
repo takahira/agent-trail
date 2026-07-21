@@ -438,31 +438,85 @@ def get_salt(base: str) -> bytes:
     # The file is present but NOT exactly 16 bytes: either TRUNCATED (creator died
     # between the O_EXCL create and the write -- SIGKILL on a hook timeout, or
     # ENOSPC) or EXTENDED past 16 (a hostile append). Either way it is untrusted --
-    # a wrong-length salt lets an attacker weaken/perturb the per-store key. Heal it:
-    # replace with a full 16-byte salt atomically, then re-read so concurrent healers
-    # converge on one value. NEVER return a salt that is not exactly 16 bytes.
-    salt = os.urandom(16)
-    tmp = "{0}.{1}.{2}.tmp".format(path, os.getpid(), os.urandom(6).hex())
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(salt)
-        os.replace(tmp, path)
-        with safe_store_read(path, "rb") as fh:
-            data = fh.read(17)
-        return data if len(data) == 16 else salt
-    except OSError:
-        with contextlib.suppress(OSError):
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        # Could not heal (e.g. disk still full): use the in-memory salt for THIS run
-        # so digests stay salted rather than degrading to an unsalted oracle.
+    # a wrong-length salt lets an attacker weaken/perturb the per-store key. Heal it
+    # under a store-wide lock so CONCURRENT healers converge on ONE salt instead of
+    # each os.replace'ing its own (which would hand a session's Pre and Post
+    # DIFFERENT keys -> incomparable digests -> a false 'modified'). NEVER return a
+    # salt that is not exactly 16 bytes.
+    return _heal_salt(base, path)
+
+
+# Bound the wait for the store-wide salt-heal lock, mirroring the session lock: a
+# wedged healer must not park the hook forever (main()'s try/except can't fail open
+# on a thread blocked in flock). On timeout we degrade to an unlocked heal -- rare
+# (real contention is sub-second), and the pre-write re-read still converges most
+# racers on the holder's value.
+SALT_LOCK_TIMEOUT = 10.0
+
+
+def _heal_salt(base: str, path: str) -> bytes:
+    """Write a fresh exactly-16-byte salt, serialized by a store-wide lock.
+
+    Under the lock we RE-READ first: a prior healer may already have persisted a
+    good salt, in which case every waiter returns THAT one value (convergence). Only
+    when the salt is still bad do we os.replace our own. If the lock can't be taken
+    (wedged holder) or persistence fails (disk full), we fall back best-effort to an
+    in-memory salt so digests stay keyed rather than degrading to an unkeyed oracle.
+    """
+    def _read16() -> Optional[bytes]:
         with contextlib.suppress(OSError):
             with safe_store_read(path, "rb") as fh:
                 data = fh.read(17)
             if len(data) == 16:
                 return data
-        return salt
+        return None
+
+    def _write_fresh() -> bytes:
+        salt = os.urandom(16)
+        tmp = "{0}.{1}.{2}.tmp".format(path, os.getpid(), os.urandom(6).hex())
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(salt)
+            os.replace(tmp, path)
+            return _read16() or salt
+        except OSError:
+            with contextlib.suppress(OSError):
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            return _read16() or salt
+
+    try:
+        lfd = os.open(os.path.join(base, "salt.lock"),
+                      os.O_WRONLY | os.O_CREAT | _SAFE_STORE_OPEN, 0o600)
+    except OSError:
+        lfd = None
+    if lfd is None:                       # cannot lock -> best-effort unlocked heal
+        return _read16() or _write_fresh()
+    try:
+        acquired = False
+        deadline = time.monotonic() + SALT_LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+        # Re-read whether or not we got the lock: a holder that just finished has
+        # persisted the winning salt, so a waiter (even one that timed out) returns
+        # that shared value instead of minting a divergent one.
+        healed = _read16()
+        if healed is not None:
+            return healed
+        return _write_fresh()
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lfd, fcntl.LOCK_UN)
+        os.close(lfd)
 
 
 def now_ts(base: str) -> float:
