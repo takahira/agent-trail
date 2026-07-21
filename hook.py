@@ -4,8 +4,8 @@
 
 A single hook that Claude Code (and other agents with a Pre/PostToolUse hook
 contract) calls *around* every tool invocation. It reads the hook payload on
-stdin and records what the agent touched into a local, content-addressed audit
-log -- with zero cloud dependency.
+stdin and records what the agent touched -- salted content digests + metadata,
+never file bytes -- into a local audit log with zero cloud dependency.
 
 Why a hook instead of `git diff` after the fact?
 ------------------------------------------------
@@ -15,27 +15,29 @@ needs three things git cannot give you from the working tree:
 1. **What a Bash command actually changed.** The command *string* (`sed -i ...`,
    `rm ...`, a script that writes files) does not tell you which files moved.
    We snapshot the work tree's content hashes immediately *before* and *after*
-   the command, so the change is reconstructed from observed state.
+   the command, so the change is detected from observed state.
 2. **Files the agent only READ.** Reading `.env` leaves no trace in git. We log
    the access, so a read of a secret is visible even though nothing changed.
 3. **A faithful before/after even for untracked / .gitignore'd files.**
 
 Secret-safety of the store itself (this is an audit tool, not a leak)
 ---------------------------------------------------------------------
-Two levels of guarantee -- one hard, one best-effort. Secret DETECTION is heuristic
-(no regex proves arbitrary content secret-free), so the promise is precise:
-- HARD: a DETECTED secret's cleartext is never stored. A file matched by
-  ``is_sensitive`` (name) OR the content sniff (whole-body credential shapes) is
-  recorded as a *salted* digest only; its bytes are never written to the object
-  store (and the salted digest is not a sha256(content) oracle).
-- BEST-EFFORT: an UNDETECTED secret can be stored. A value in an unusual shape, a
-  novel vendor prefix, or a secret embedded in a filename/path/symlink target can
-  land in the object store or NDJSON log as part of otherwise-innocuous content.
-- DEFENSE-IN-DEPTH backstops that: the whole store is created 0700 with 0600
-  objects, and an ``.alog/.gitignore`` (``*``) is dropped in so it can't be
-  committed or read by other local users. Treat ``.alog/`` as sensitive.
-- Stored Bash command strings / prompts are passed through ``redact_command`` /
-  ``redact_prompt`` to mask inline tokens (best-effort).
+**File contents are never stored, period.** Every file is recorded as a keyed
+(HMAC-SHA256), truncated digest plus metadata (size / mode / timestamps); the key
+is per-store random, so a digest seen WITHOUT the store cannot be matched to
+guessed content (no cross-store rainbow table). This is NOT a defence once someone
+has the whole store -- the key lives in it beside the digests -- so treat the
+store as sensitive. Sensitive files record no size (byte length is withheld too).
+What CAN still land in the log, best-effort guarded:
+- Bash command strings and user prompts ARE stored (that is the audit's job);
+  they pass through ``redact_command`` / ``redact_prompt`` first, which mask
+  recognisable inline tokens. A freeform secret with no recognisable shape is
+  not caught.
+- A secret embedded in a filename / path / symlink target is recorded as part
+  of the path (symlink targets are additionally redacted).
+- DEFENSE-IN-DEPTH: the whole store is created 0700 with 0600 files, and an
+  ``.alog/.gitignore`` (``*``) is dropped in so it can't be committed or read
+  by other local users. Treat ``.alog/`` as sensitive.
 
 Event model
 -----------
@@ -73,6 +75,7 @@ import errno
 import fcntl
 import fnmatch
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -104,7 +107,9 @@ TREE_SKIP_DIRS = {".git", ".alog", "node_modules", ".venv", "venv",
                   "__pycache__", ".mypy_cache", ".pytest_cache", "dist",
                   "build", ".next", "target"}
 
-MAX_BLOB_BYTES = 10 * 1024 * 1024
+# A file larger than this is never read/hashed -- it is recorded stat-only
+# (size + mtime + ctime), which still detects changes. Bounds hook I/O & memory.
+MAX_HASH_BYTES = 10 * 1024 * 1024
 
 # Sensitive-file matching. Bias: PRECISE (few false positives) over exhaustive.
 # Detection here is non-blocking -- a missed file is still logged as an access
@@ -139,14 +144,13 @@ SENSITIVE_GLOBS = [
 #        names essentially never occur as an ordinary project ancestor.
 #   REL: generic nouns, checked only against the cwd-RELATIVE path -- a repo merely
 #        CLONED under ~/projects/secrets/ or ~/code/gcloud/ must NOT have every file
-#        wholesale-withheld (which would make `alog diff` useless for the project).
+#        wholesale-flagged (which would drown `alog audit` in false positives).
 SENSITIVE_DIR_SEGMENTS_ABS = {".ssh", ".aws", ".gnupg", ".kube", ".docker"}
 SENSITIVE_DIR_SEGMENTS_REL = {"gcloud", "secrets"}
 SENSITIVE_PATH_SEGMENTS = SENSITIVE_DIR_SEGMENTS_ABS | SENSITIVE_DIR_SEGMENTS_REL
-# Allowlist, checked FIRST: public / template artifacts are NEVER secret. This
-# both removes audit noise and keeps their content stored so the diff stays
-# reconstructable. Without it, ".env.example" / "id_rsa.pub" / public certs were
-# mis-flagged as secret -> content withheld -> their real diffs became unviewable.
+# Allowlist, checked FIRST: public / template artifacts are NEVER secret, so
+# they don't pollute `alog audit` with false "secret access" lines. Without it,
+# ".env.example" / "id_rsa.pub" / public certs were mis-flagged as secret.
 SENSITIVE_ALLOW_EXACT = {
     "fullchain.pem", "chain.pem", "cert.pem", "ca.pem", "ca-cert.pem",
     "cacert.pem", "dhparam.pem", "public.pem",
@@ -154,11 +158,9 @@ SENSITIVE_ALLOW_EXACT = {
 SENSITIVE_ALLOW_RE = re.compile(
     r"(?i)(?:\.env|\.dev\.vars)(\.[^.]+)*\.(example|sample|template|tmpl|dist|default|spec)$")
 # NOTE on sc-2 (Secret.md / Secrets/ false-positives): a doc-extension carve-out
-# was tried and REVERTED. Marking secret(s).md non-sensitive *also* stored its
-# bytes in the CAS, so a file genuinely named secrets.md that holds real secrets
-# would leak at rest -- and the content sniff only catches key-SHAPED secrets,
-# not API_KEY=.../prose. Over-flagging an innocent doc (content withheld + audit
-# noise) is the fail-safe price; never trade the at-rest guarantee for it.
+# was tried and REVERTED. Over-flagging an innocent doc (audit noise) is the
+# fail-safe price; a file genuinely named secrets.md that holds real secrets
+# must keep its sensitive classification.
 
 # "Bearer <cred>" is handled separately from the token-shape list because it is
 # prose-aware: a shell COMMAND with "Bearer x" is almost always an auth header, so
@@ -245,103 +247,8 @@ ARG_SECRET_RE = re.compile(
     r"(?i)\b(aws_secret_access_key|aws_access_key_id|aws_session_token)(\s+)"
     r"(\"[^\"]*\"|'[^']*'|[^\s;|&]+)")
 
-# The unambiguous private-key header. Checked even for allowlisted names so a real
-# key body can never sit at rest under a public/template filename (atrest-1).
-PRIVATE_KEY_RE = re.compile(
-    rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----")
-# CONTENT sniff: if a file's content looks like a private key / cloud credential we
-# refuse to store its bytes EVEN IF the name heuristic missed it. This makes the
-# "secret content never at rest" guarantee robust to classifier recall gaps.
-#
-# Two tiers. HIGH-CONFIDENCE anchored vendor SHAPES (below) effectively never occur
-# in genuine public-key / certificate bytes: standard base64 has no '-', and an
-# accidental "AKIA"+12 uppercase-alnum run is astronomically unlikely. So these are
-# scanned over the WHOLE content EVEN for a sniff-exempt (*.pub / public-cert) name
-# -- closing the "public head + appended cloud token" leak. This is the byte mirror
-# of TOKEN_SHAPE_RES.
-SECRET_CONTENT_TOKEN_RES = [
-    PRIVATE_KEY_RE,
-    re.compile(rb"\bAKIA[0-9A-Z]{12,}"),
-    re.compile(rb"\bAIza[0-9A-Za-z_\-]{35}"),               # Google API key
-    re.compile(rb"\bgh[opsru]_[A-Za-z0-9]{20,}"),           # ghp_/gho_/ghs_/ghr_/ghu_
-    re.compile(rb"\bgithub_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(rb"\bglpat-[A-Za-z0-9_\-]{20,}"),            # GitLab PAT
-    re.compile(rb"\bhvs\.[A-Za-z0-9_\-]{20,}"),             # Vault service token
-    re.compile(rb"\bxox[baeprs]-[A-Za-z0-9\-]{8,}"),        # Slack (incl. xoxe)
-    re.compile(rb"\bxapp-[0-9]-[A-Za-z0-9\-]{8,}"),         # Slack app-level token
-    re.compile(rb"\bsk-[A-Za-z0-9_\-]{8,}"),                # OpenAI-style
-    re.compile(rb"\bsk_(?:live|test)_[A-Za-z0-9]{16,}"),    # Stripe secret key
-    re.compile(rb"\brk_(?:live|test)_[A-Za-z0-9]{16,}"),    # Stripe restricted key
-    re.compile(rb"\beyJ[A-Za-z0-9_-]{6,}\.eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}"),  # JWT
-    # scheme://user:pass@host connection string (the byte mirror of URL_CRED_RE).
-    # Without this a `postgres://appuser:Sup3rSecret@db/prod` in a normally-named
-    # config file (database.yml, docker-compose.yml, settings.py) was stored in the
-    # CAS verbatim while the SAME string was masked in a command -- a parity gap
-    # that broke the "file contents are never stored [in cleartext]" promise.
-    # scheme://user:pass@host -- password run allows '@'/':' INSIDE it (mirrors the
-    # string URL_CRED_RE), greedily backtracking to the LAST '@host' so a password
-    # containing '@' is still detected, not just up to its first '@'.
-    re.compile(rb"[a-zA-Z][a-zA-Z0-9+.\-]{0,15}://[^/\s:@]*:[^/\s]+@[^/\s@:]+"),
-]
-# BROADER value-shaped patterns that COULD (rarely) trip on certificate metadata or
-# structured public text. These are SKIPPED for structurally-public sniff-exempt
-# content, and run for everything else. Each requires an actual VALUE after the key
-# name, not a bare mention, so a README naming AWS_SECRET_ACCESS_KEY is not withheld.
-# Secret-ish KEY NAMES for the content sniff, kept at PARITY with the command
-# redactor's KV_SECRET_RE (bare `secret`/`token`/`auth` were missing, so a
-# `{"secret":"..."}` / `{"token":"..."}` config was stored while the same string in
-# a command was masked). Longest alternatives first so a compound name still matches.
-_SECRET_KEY_NAMES = (
-    rb"passphrase|password|passwd|pgpass(?:word)?|pwd|"
-    rb"secret[_-]?(?:access[_-]?)?key|client[_-]?secret|access[_-]?key|api[_-]?key|"
-    rb"session[_-]?token|auth[_-]?token|private[_-]?key|credential|secret|token|auth")
-SECRET_CONTENT_BROAD_RES = [
-    re.compile(rb"(?i)aws_secret_access_key['\"\s]*[=:]['\"\s]*[A-Za-z0-9/+]{16,}"),
-    # A credential assigned a QUOTED value in structured config (yaml/json/toml/env),
-    # e.g. `DB_PASSWORD: "hunter2"`, `{"secret":"..."}`. Requiring quotes keeps this
-    # from withholding ordinary source like `password = get_secret()`.
-    re.compile(rb"(?i)(?:" + _SECRET_KEY_NAMES + rb")['\"]?\s*[:=]\s*['\"][^'\"\r\n]{6,}['\"]"),
-    # The `[\w-]{0,40}` run around the key name is BOUNDED for the same reason as
-    # KV_SECRET_RE (see L189-191): an unbounded `[\w-]*` after this alternation
-    # backtracks quadratically (ReDoS) on a long keyword run with no `:`/`=` (e.g.
-    # a planted `b"auth"*n` file), hanging the hook inside re -- a blocked C loop
-    # main()'s fail-open cannot interrupt. 40 chars covers every real compound name.
-    # UNQUOTED KEY=value / KEY: value secret (the .env / .envrc / yaml / WireGuard
-    # `PrivateKey =` form, e.g. `password: swordfish`, `API_KEY=supersecret`). No
-    # placeholder/value exemption: three attempts at one (round 6-7) each leaked a
-    # real secret that started with or merely contained a placeholder word, so the
-    # exemption is GONE -- fail-safe. The only guard is `(?![\w(])`, which spares
-    # `password = get_secret()` source. COST: a `.env.example` with a 6+ placeholder
-    # value (`API_KEY=replace_me_example`) is now WITHHELD (its diff is digest-only in
-    # `alog`); templates are committed to git anyway, so this is an acceptable trade
-    # for never leaking a real unquoted secret.
-    re.compile(rb"(?i)(?:" + _SECRET_KEY_NAMES + rb")[\w-]{0,40}\s*[:=]\s*"
-               rb"([A-Za-z0-9/+._\-]{6,})(?![\w(])"),
-    # HIGH-CONFIDENCE names get NO length floor: a real secret can be short
-    # (`password: abcde`). Any non-empty value that isn't a function call is withheld
-    # (again no placeholder/boolean lookahead -- see above; a `password: false` config
-    # flag being withheld is the fail-safe price).
-    re.compile(rb"(?i)(?:password|passwd|passphrase|pgpassword|client[_-]?secret|"
-               rb"secret[_-]?access[_-]?key|private[_-]?key)[\w-]{0,40}\s*[:=]\s*['\"]?"
-               rb"([A-Za-z0-9/+._\-]{1,})(?![\w(])"),
-]
-# The full sniff (both tiers) for a non-exempt file.
-SECRET_CONTENT_RES = SECRET_CONTENT_TOKEN_RES + SECRET_CONTENT_BROAD_RES
-# Structurally-PUBLIC content shapes. A sniff-exempt NAME (*.pub / a public-cert
-# allowlist entry) only actually earns the exemption if its BYTES start like public
-# material -- otherwise the ".pub" is just an attacker-chosen suffix on a file that
-# holds a real token, and the exemption would store that secret in cleartext.
-PUBLIC_MATERIAL_PREFIXES = (
-    b"ssh-", b"ecdsa-", b"sk-ssh-",                 # OpenSSH public keys
-    b"-----BEGIN CERTIFICATE-----",
-    b"-----BEGIN PUBLIC KEY-----",
-    b"-----BEGIN RSA PUBLIC KEY-----",
-    b"-----BEGIN DH PARAMETERS-----",
-)
-
-# PEM private-key block masking for STRINGS (commands/prompts). The file path uses
-# the bytes PRIVATE_KEY_RE as an unconditional at-rest guard (atrest-1); a pasted
-# key in a prompt/command needs the same protection before it lands in the log.
+# PEM private-key block masking for STRINGS (commands/prompts): a pasted key in a
+# prompt/command needs masking before it lands in the log.
 # Masked by a LINEAR scanner (mask_pem_blocks), NOT a `HDR.*?FTR` regex: a lazy
 # `.*?` between header and footer retries from EVERY header on input with many
 # headers and no footer, which is quadratic (ReDoS) -- and redaction runs on the
@@ -468,7 +375,9 @@ def ensure_dirs(base: str) -> None:
     os.makedirs(base, mode=0o700, exist_ok=True)
     with contextlib.suppress(OSError):
         os.chmod(base, 0o700)
-    for sub in ("objects", "sessions", "pending", "locks", "manifests", "cursors"):
+    # NOTE: no "objects" dir -- file contents are never stored (v0.2+). A legacy
+    # v0.1 store's objects/ is dead weight and can be deleted by the user.
+    for sub in ("sessions", "pending", "locks", "manifests", "cursors"):
         d = os.path.join(base, sub)
         os.makedirs(d, mode=0o700, exist_ok=True)
         with contextlib.suppress(OSError):
@@ -482,23 +391,36 @@ def ensure_dirs(base: str) -> None:
 
 
 def get_salt(base: str) -> bytes:
-    """Per-store random salt for sensitive-file digests (0600). Created once.
+    """Per-store random HMAC key for ALL content digests (0600). Created once,
+    exactly 16 bytes (a wrong length is healed, never honoured).
 
-    Salting means a recorded sensitive digest is not a plain sha256(content),
-    so it cannot be used to confirm a guessed low-entropy secret offline.
+    The key means a recorded digest is not a plain ``sha256(content)``, so a digest
+    seen WITHOUT the store (a log line pasted elsewhere, a cross-store rainbow
+    table) cannot be matched to guessed content. It is NOT a defence against an
+    attacker who has the whole ``.alog/`` -- the key lives there beside the digests,
+    so treat the store as sensitive (it also holds command strings and prompts).
+    One key per store keeps digest equality working across that store's sessions.
     """
     path = os.path.join(base, "salt")
     for _ in range(100):
-        # Reader path: only trust a fully-written salt (>=16 bytes). A racing
-        # creator may have made the file but not yet written it.
+        # Reader path: only trust an EXACTLY-16-byte salt. A racing creator may
+        # have made the file but not yet written it (short read -> wait/retry).
+        # A read of >16 bytes means the salt was TRUNCATED-then-extended (a hostile
+        # agent can append to .alog/salt, which is excluded from Bash snapshots):
+        # digests use HMAC now so length no longer creates a concatenation oracle,
+        # but a variable-length salt still lets an attacker perturb only some files'
+        # keys. Enforce a fixed 16 bytes -- read one past it and reject anything but
+        # exactly 16 (heal below), so no oversized salt is ever honoured.
         if os.path.exists(path):
             try:
                 with safe_store_read(path, "rb") as fh:
-                    data = fh.read()
+                    data = fh.read(17)
             except OSError:
                 data = b""
-            if len(data) >= 16:
+            if len(data) == 16:
                 return data
+            if len(data) > 16:
+                break                 # oversized/tampered -> heal to exactly 16
             time.sleep(0.005)
             continue
         # Writer path: O_EXCL means exactly one process wins the create; the
@@ -513,14 +435,12 @@ def get_salt(base: str) -> bytes:
         with os.fdopen(fd, "wb") as fh:
             fh.write(salt)
         return salt
-    # After the whole wait budget the file still exists but is <16 bytes: the
-    # original creator died between the O_EXCL create and the write (SIGKILL on a
-    # hook timeout, or ENOSPC), leaving a TRUNCATED salt. Returning it would make
-    # sensitive_digest(short_salt, content) effectively unsalted -- a sha256(content)
-    # oracle that lets an attacker offline-confirm a guessed low-entropy secret, the
-    # exact property the salt exists to defeat. Heal it: replace with a full 16-byte
-    # salt atomically, then re-read so concurrent healers converge on one value.
-    # NEVER return a salt shorter than 16 bytes.
+    # The file is present but NOT exactly 16 bytes: either TRUNCATED (creator died
+    # between the O_EXCL create and the write -- SIGKILL on a hook timeout, or
+    # ENOSPC) or EXTENDED past 16 (a hostile append). Either way it is untrusted --
+    # a wrong-length salt lets an attacker weaken/perturb the per-store key. Heal it:
+    # replace with a full 16-byte salt atomically, then re-read so concurrent healers
+    # converge on one value. NEVER return a salt that is not exactly 16 bytes.
     salt = os.urandom(16)
     tmp = "{0}.{1}.{2}.tmp".format(path, os.getpid(), os.urandom(6).hex())
     try:
@@ -529,8 +449,8 @@ def get_salt(base: str) -> bytes:
             fh.write(salt)
         os.replace(tmp, path)
         with safe_store_read(path, "rb") as fh:
-            data = fh.read()
-        return data if len(data) >= 16 else salt
+            data = fh.read(17)
+        return data if len(data) == 16 else salt
     except OSError:
         with contextlib.suppress(OSError):
             if os.path.exists(tmp):
@@ -539,8 +459,8 @@ def get_salt(base: str) -> bytes:
         # so digests stay salted rather than degrading to an unsalted oracle.
         with contextlib.suppress(OSError):
             with safe_store_read(path, "rb") as fh:
-                data = fh.read()
-            if len(data) >= 16:
+                data = fh.read(17)
+            if len(data) == 16:
                 return data
         return salt
 
@@ -560,47 +480,14 @@ def now_ts(base: str) -> float:
 def is_allowlisted(path: str) -> bool:
     """NAME-based classification only: public / template artifacts that is_sensitive
     treats as NOT secret (public keys, public certs, env/vars templates), so they
-    don't add audit noise and their clean content stays diffable.
-
-    This governs ONLY the name heuristic -- it does NOT control at-rest storage.
-    The content-sniff exemption is a strict SUBSET handled separately by
-    is_sniff_exempt(), which deliberately does NOT exempt env/vars templates: a real
-    secret copy-pasted into a .env.example is still withheld (recorded as a salted
-    digest), never stored. Do not route the storage decision through this function
-    -- doing so would leak template secrets at rest.
-    """
+    don't add audit noise. Classification only -- no content is ever stored for
+    ANY file, allowlisted or not."""
     lname = os.path.basename(path.replace("\\", "/")).lower()
     if lname.endswith(".pub"):
         return True
     if lname in SENSITIVE_ALLOW_EXACT:
         return True
     if SENSITIVE_ALLOW_RE.search(lname):
-        return True
-    return False
-
-
-def is_sniff_exempt(path: str) -> bool:
-    """Names for which only the BROAD value-shaped content patterns are skipped --
-    a strict subset of is_allowlisted. Only structurally-public artifacts qualify:
-    public keys (*.pub) and public certificates.
-
-    This exemption is NOT a blanket skip: the high-confidence vendor token shapes
-    (content_has_token_shape) and the private-key header are still scanned over the
-    whole body even for an exempt name, so a cloud token (AWS/Stripe/Google/JWT)
-    appended after a genuine public-key head is still withheld from the store. Only
-    the broad quoted-KV / aws_secret patterns -- which could trip on certificate
-    metadata -- are relaxed. And the exemption applies only when the content itself
-    starts as public material (content_is_public_material), not on the name alone.
-
-    Env/vars TEMPLATES (.env.example, .dev.vars.template, ...) are deliberately
-    NOT exempt: copying a real .env to .env.example without stripping values is a
-    common leak, so those keep the full sniff active. is_sensitive still treats all
-    of them as non-sensitive by name (no audit noise); this narrower gate only
-    governs at-rest content storage."""
-    lname = os.path.basename(path.replace("\\", "/")).lower()
-    if lname.endswith(".pub"):
-        return True
-    if lname in SENSITIVE_ALLOW_EXACT:
         return True
     return False
 
@@ -646,7 +533,7 @@ def abspath_has_sensitive_dir(abs_path: str) -> bool:
     config dot-dir (.ssh/.aws/...). Handles the case where the agent's cwd is INSIDE
     such a dir (so the relative display path lost the segment). Generic nouns
     (secrets/gcloud) are deliberately NOT checked here -- an ancestor named 'secrets'
-    is a common project location and must not wholesale-withhold the repo."""
+    is a common project location and must not wholesale-flag the repo."""
     parts = [p.lower() for p in abs_path.replace("\\", "/").split("/")[:-1] if p]
     return any(seg in parts for seg in SENSITIVE_DIR_SEGMENTS_ABS)
 
@@ -674,47 +561,6 @@ def path_is_sensitive(ap: str, disp: str, cwd: str) -> bool:
     if abspath_has_sensitive_dir(rp) or is_sensitive(rel_to_cwd(rcwd, rp)):
         return True
     return False
-
-
-def content_looks_secret(content: bytes) -> bool:
-    """True if content matches ANY private-key / cloud-credential shape (both the
-    high-confidence vendor shapes and the broader value-shaped patterns). Used for
-    a non-exempt file, where the whole content is fair game to withhold."""
-    for rx in SECRET_CONTENT_RES:
-        if rx.search(content):
-            return True
-    return False
-
-
-def content_has_token_shape(content: bytes) -> bool:
-    """True if content matches a HIGH-CONFIDENCE anchored vendor token shape
-    (AKIA/AIza/ghp_/github_pat_/xox/sk-/sk_live_/rk_live_/JWT, plus a private-key
-    header). These never occur in genuine public-key / certificate bytes, so they
-    are scanned even for a sniff-EXEMPT name -- a *.pub whose head is a real public
-    key but which has a cloud token appended past the head is still withheld."""
-    for rx in SECRET_CONTENT_TOKEN_RES:
-        if rx.search(content):
-            return True
-    return False
-
-
-def content_has_private_key(head: bytes) -> bool:
-    """True only for an unambiguous private-key header. Run even on allowlisted
-    names: public keys / public certs / env templates never match it, so a real
-    private key can't sit at rest under such a name (atrest-1)."""
-    return bool(PRIVATE_KEY_RE.search(head))
-
-
-def content_is_public_material(head: bytes) -> bool:
-    """True if a file's HEAD structurally begins as PUBLIC key/cert material.
-
-    Used to VERIFY a sniff-exempt name before honouring its exemption: a *.pub or
-    public-cert name only skips the broad credential sniff if its bytes actually
-    look public (ssh-.../-----BEGIN CERTIFICATE-----/...). A file merely NAMED
-    'config.pub' that holds an sk_live_ token does not qualify, so the sniff still
-    runs and its secret is withheld from the store."""
-    h = head.lstrip()
-    return any(h.startswith(p) for p in PUBLIC_MATERIAL_PREFIXES)
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -827,7 +673,7 @@ def redact_prompt(text: str) -> str:
     This is a backstop, not a guarantee: freeform secrets with no recognisable
     shape are not caught -- the audit records what was asked, and keeping the store
     from being a cleartext secret sink is a best-effort property here (unlike file
-    content, where the CAS never persists a sensitive blob at all).
+    content, which is never persisted at all).
 
     Redact before truncating (see redact_command) so a secret near the length cap
     can't be split out of its own mask by the truncation boundary."""
@@ -885,41 +731,26 @@ def scan_cmd_for_secrets(command: str, cwd: str) -> List[str]:
     return found
 
 
-def store_blob(base: str, content: bytes) -> str:
-    """Write content into the CAS (sha256, write-once, 0600); return hex sha.
+def salted_digest(salt: bytes, content: bytes, sensitive: bool = False) -> str:
+    """Keyed, truncated digest -- the ONLY thing ever recorded about a file's
+    content. File bytes are never written anywhere (no CAS / object store).
 
-    The tmp name is per-writer unique (pid + random) so two sessions writing the
-    same object don't share one ``.tmp`` and clobber each other mid-publish.
-    os.replace is atomic and the content is identical, so a racing publish is
-    harmless; we just suppress the loser's ENOENT.
-    """
-    sha = hashlib.sha256(content).hexdigest()
-    obj_dir = os.path.join(base, "objects", sha[:2])
-    obj_path = os.path.join(obj_dir, sha)
-    if not os.path.exists(obj_path):
-        os.makedirs(obj_dir, mode=0o700, exist_ok=True)
-        # Heal a pre-existing prefix dir loosened by a copy/umask: a 0700 objects
-        # dir blocks other local users from reaching the blobs inside regardless of
-        # each blob's own mode (new blobs are written 0600 via the tmp below).
-        with contextlib.suppress(OSError):
-            os.chmod(obj_dir, 0o700)
-        tmp = "{0}.{1}.{2}.tmp".format(obj_path, os.getpid(), os.urandom(6).hex())
-        try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(content)
-            with contextlib.suppress(FileNotFoundError):
-                os.replace(tmp, obj_path)
-        finally:
-            with contextlib.suppress(OSError):
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-    return sha
+    Uses HMAC-SHA256 (salt as the key), NOT ``sha256(salt + content)``: a plain
+    concatenation is ambiguous (``sha256(A + B)`` where the split is unknown), so
+    an attacker who can extend ``.alog/salt`` by a file's own prefix could make a
+    real change hash-collide with the pre-change state and hide it as an unchanged
+    'read'. HMAC's fixed block/keying removes that boundary ambiguity; get_salt's
+    exact-16-byte enforcement backs it up. Events only compare digests for
+    before/after EQUALITY, so a truncated keyed hash carries all the audit needs.
+    The ``S:`` prefix marks a sensitive file (name/path heuristic) purely for
+    readability; ``D:`` is everything else."""
+    prefix = "S:" if sensitive else "D:"
+    return prefix + hmac.new(salt, content, hashlib.sha256).hexdigest()[:16]
 
 
 def sensitive_digest(salt: bytes, content: bytes) -> str:
-    """Salted, truncated digest for a sensitive file -- NOT stored as a blob."""
-    return "S:" + hashlib.sha256(salt + content).hexdigest()[:16]
+    """Salted, truncated digest for a sensitive file (compat wrapper)."""
+    return salted_digest(salt, content, sensitive=True)
 
 
 def _toolarge_rec(st, sensitive: bool) -> Dict:
@@ -961,17 +792,14 @@ def _nonregular_rec(abs_path: str) -> Dict:
     return rec
 
 
-def snapshot_file(base: str, abs_path: str, salt: bytes,
-                  sensitive: bool, sniff_exempt: bool = False) -> Optional[Dict]:
-    """Content-address one regular file. None if it does not exist.
+def snapshot_file(abs_path: str, salt: bytes, sensitive: bool) -> Optional[Dict]:
+    """Digest one regular file (salted hash + metadata). None if it does not exist.
 
-    Sensitive files (by name OR by content sniff) are recorded as a salted digest
-    and their content is NOT persisted -- UNLESS the name is sniff-exempt (a public
-    key / public cert; see is_sniff_exempt), in which case the BROAD content sniff
-    is skipped so the public content stays storable and the diff reconstructable.
-    The private-key header check runs regardless. Symlinks are never followed
-    (opened O_NOFOLLOW so a swap after any check can't reach the target); other
-    non-regular paths are recorded as kind='non-regular'.
+    No file bytes are ever persisted -- every file is recorded as a salted,
+    truncated digest plus size/mode; ``sensitive`` only switches the digest
+    prefix and sets the ``redacted`` flag for the audit view. Symlinks are never
+    followed (opened O_NOFOLLOW so a swap after any check can't reach the
+    target); other non-regular paths are recorded as kind='non-regular'.
     """
     if not os.path.lexists(abs_path):
         return None
@@ -998,11 +826,11 @@ def snapshot_file(base: str, abs_path: str, salt: bytes,
             st = os.fstat(fh.fileno())
             if not stat.S_ISREG(st.st_mode):   # FIFO/socket/device -- not content
                 return _nonregular_rec(abs_path)
-            if st.st_size > MAX_BLOB_BYTES:
+            if st.st_size > MAX_HASH_BYTES:
                 return _toolarge_rec(st, sensitive)
             # Read one past the cap: if the file GREW past the limit, treat it as
             # too-large rather than slurping unbounded bytes.
-            content = fh.read(MAX_BLOB_BYTES + 1)
+            content = fh.read(MAX_HASH_BYTES + 1)
     except OSError as exc:
         log_internal("unreadable {0}: {1}".format(abs_path, exc))
         # Carry size/mtime so a later change to a still-unreadable file is not
@@ -1013,31 +841,14 @@ def snapshot_file(base: str, abs_path: str, salt: bytes,
                     "mtime": est.st_mtime_ns, "ctime": est.st_ctime_ns}
         except OSError:
             return {"sha": None, "size": 0, "unreadable": True}
-    if len(content) > MAX_BLOB_BYTES:
+    if len(content) > MAX_HASH_BYTES:
         return _toolarge_rec(st, sensitive)
-    # Withhold content from the store when the NAME says secret, OR the file has an
-    # unambiguous PRIVATE KEY header, OR a credential sniff fires. Scan the WHOLE
-    # stored content, not just a head window: store_blob persists every byte, so a
-    # token past the first few KiB would otherwise land in the CAS in cleartext.
-    #
-    # The public-key/cert sniff exemption was REMOVED: it skipped the BROAD sniff for
-    # a *.pub/cert name, so a non-token secret appended after a genuine public-key head
-    # (e.g. a `password:` line) was stored in cleartext. A real public key / cert never
-    # matches the broad patterns anyway (no `password: value`, and its base64 body won't
-    # form a vendor token), so running the full sniff on EVERYTHING is safe and closes
-    # the leak. `sniff_exempt` is accepted for call-site compatibility but ignored.
-    del sniff_exempt
-    sniff_hit = content_looks_secret(content)
-    # A hard link (st_nlink > 1) can be an alias of a sensitive file under a
-    # non-sensitive name (`ln .env notes.txt`): the same secret bytes reachable via
-    # the innocuous name would otherwise be stored. Conservatively withhold every
-    # multi-linked regular file (over-withholds the rare legit hardlink -- fail-safe).
-    hardlinked = getattr(st, "st_nlink", 1) > 1
     mode = stat.S_IMODE(st.st_mode)          # permission bits, for chmod detection
-    if sensitive or hardlinked or content_has_private_key(content) or sniff_hit:
-        return {"sha": sensitive_digest(salt, content), "size": len(content),
-                "redacted": True, "mode": mode}
-    return {"sha": store_blob(base, content), "size": len(content), "mode": mode}
+    rec = {"sha": salted_digest(salt, content, sensitive),
+           "size": len(content), "mode": mode}
+    if sensitive:
+        rec["redacted"] = True   # sensitive access -- surfaced by `alog audit`
+    return rec
 
 
 def rel_to_cwd(cwd: str, abs_path: str) -> str:
@@ -1054,9 +865,8 @@ def walk_worktree(cwd: str, store_base: Optional[str] = None) -> List[str]:
     # ``store_base`` is the audit store's own directory (data_dir()); it is pruned
     # from the walk by ABSOLUTE PATH, not by the hardcoded name '.alog'. With
     # ALOG_DATA pointing at an in-repo dir under any other name, the old name-only
-    # skip walked the store itself and stored its 'salt' (plaintext, non-sensitive
-    # by name) into the CAS -- exposing the salt (a known-salt digest oracle) and
-    # re-snapshotting the growing store on every Bash (quadratic growth).
+    # skip walked (and re-hashed) the growing store itself on every Bash --
+    # quadratic growth, plus digesting the salt file with itself.
     skip_abs = os.path.abspath(store_base) if store_base else None
     out = []
     for root, dirs, files in os.walk(cwd, followlinks=False):
@@ -1108,15 +918,14 @@ def files_of_interest(tool: str, tool_input: Dict, cwd: str) -> List[str]:
     return []
 
 
-def snapshot_set(base: str, abs_paths: List[str], cwd: str,
+def snapshot_set(abs_paths: List[str], cwd: str,
                  salt: bytes) -> Dict[str, Optional[Dict]]:
     snap: Dict[str, Optional[Dict]] = {}
     for ap in abs_paths:
         disp = rel_to_cwd(cwd, ap)
         # Classify by the ABSOLUTE path so a sensitive segment ABOVE cwd (e.g. the
         # agent runs under ~/.ssh, making disp just "config") is still seen.
-        snap[disp] = snapshot_file(base, ap, salt, path_is_sensitive(ap, disp, cwd),
-                                   is_sniff_exempt(disp))
+        snap[disp] = snapshot_file(ap, salt, path_is_sensitive(ap, disp, cwd))
     return snap
 
 
@@ -1150,6 +959,33 @@ def save_manifest(base: str, session: str, manifest: Dict[str, Dict]) -> None:
         with contextlib.suppress(OSError):
             if os.path.exists(tmp):
                 os.remove(tmp)
+
+
+def _reusable_rec(rec: Optional[Dict], cur_sensitive: bool) -> bool:
+    """Whether a manifest-cached rec may be reused for an unchanged file.
+
+    Two gates beyond the stat-key match the caller already did:
+
+    1. DIGEST FORMAT. Only a v0.2 keyed digest (``D:``/``S:`` prefix) or a
+       content-less rec (``sha`` is None: too-large / unreadable / non-regular)
+       may be reused. A v0.1 store's plain 64-hex ``sha256(content)`` shares the
+       exact same ``{key, rec}`` manifest schema, so without this check an
+       upgraded store would copy those UNSALTED hashes verbatim into new v0.2
+       events -- re-introducing the offline oracle the keyed digest removed.
+    2. CLASSIFICATION CONTEXT. path_is_sensitive depends on the cwd-relative
+       display path, so one abspath can be sensitive under cwd A (``secrets/x``)
+       and not under cwd B (``x``). Reusing a rec whose sensitivity no longer
+       matches would emit a stale ``S:``/redacted (or ``D:``) record in the wrong
+       context. Require the cached rec's sensitivity to equal the current one.
+    """
+    if not isinstance(rec, dict) or "sha" not in rec:
+        return False
+    sha = rec.get("sha")
+    if sha is not None and not (isinstance(sha, str) and sha[:2] in ("D:", "S:")):
+        return False                    # v0.1 plain-hex / corrupt -> re-read
+    cached_sensitive = (isinstance(sha, str) and sha.startswith("S:")) \
+        or bool(rec.get("redacted"))
+    return cached_sensitive == cur_sensitive
 
 
 def snapshot_tree(base: str, cwd: str, salt: bytes,
@@ -1191,15 +1027,13 @@ def snapshot_tree(base: str, cwd: str, salt: bytes,
         # virtually never set, so the reuse cache stays fully effective.
         racy = (st.st_mtime_ns % 1_000_000_000 == 0
                 or st.st_ctime_ns % 1_000_000_000 == 0)
-        # Reuse only a structurally-complete rec (require "sha"): a corrupted or
-        # old-schema on-disk manifest must fall through to a fresh read, not be
-        # trusted as a content-less {} (which would drop the file silently).
+        cur_sensitive = path_is_sensitive(ap, disp, cwd)
+        cached_rec = cached.get("rec") if isinstance(cached, dict) else None
         if (not racy and isinstance(cached, dict) and cached.get("key") == key
-                and isinstance(cached.get("rec"), dict) and "sha" in cached["rec"]):
-            rec = cached["rec"]                       # unchanged -> reuse, no read
+                and _reusable_rec(cached_rec, cur_sensitive)):
+            rec = cached_rec                          # unchanged -> reuse, no read
         else:
-            rec = snapshot_file(base, ap, salt, path_is_sensitive(ap, disp, cwd),
-                                is_sniff_exempt(disp))
+            rec = snapshot_file(ap, salt, cur_sensitive)
         snap[disp] = rec
         new_manifest[mkey] = {"key": key, "rec": rec}
     save_manifest(base, session, new_manifest)
@@ -1293,7 +1127,7 @@ def _load_stack(path: str) -> List[Dict]:
 
 
 def _write_stack(path: str, stack: List[Dict]) -> None:
-    # Per-writer tmp name (pid+random), matching store_blob/save_manifest: on a
+    # Per-writer tmp name (pid+random), matching save_manifest: on a
     # filesystem where flock is advisory-ignored (some NFS/SMB), two same-session
     # writers would otherwise share one fixed `.tmp` inode and interleave writes.
     tmp = "{0}.{1}.{2}.tmp".format(path, os.getpid(), os.urandom(6).hex())
@@ -1304,7 +1138,7 @@ def _write_stack(path: str, stack: List[Dict]) -> None:
         os.replace(tmp, path)
     finally:
         # Remove a partial tmp if json.dump failed mid-write (ENOSPC/EIO) before the
-        # replace -- mirrors save_manifest/store_blob so no stray .tmp is left behind.
+        # replace -- mirrors save_manifest so no stray .tmp is left behind.
         with contextlib.suppress(OSError):
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -1633,9 +1467,22 @@ def build_changes(before: Dict[str, Optional[Dict]],
             a_mode = _meta(a, "mode")
             mode_changed = (b_mode is not None and a_mode is not None
                             and b_mode != a_mode)
+            # Defense-in-depth tripwire: for a normal (regular, hashed) file an
+            # equal digest but DIFFERENT size is impossible for an honest keyed
+            # hash (content fixes both). If it happens, the digest was forged --
+            # a tampered/extended salt trying to hide a real edit as a 'read'.
+            # Treat any digest-equal-but-size-different regular file as modified,
+            # never a silent read. (unavailable files carry sha=None and are
+            # handled by the mtime/ctime branch below.)
+            size_mismatch = (not b_nonreg and not a_nonreg and not unavailable
+                             and _meta(b, "size") is not None
+                             and _meta(a, "size") is not None
+                             and _meta(b, "size") != _meta(a, "size"))
             if nonreg_changed:
                 status = "modified"
             elif mode_changed:
+                status = "modified"
+            elif size_mismatch:
                 status = "modified"
             elif unavailable and (
                     _meta(b, "size") != _meta(a, "size")
@@ -1670,26 +1517,33 @@ def build_changes(before: Dict[str, Optional[Dict]],
             "status": status,
             "before": b_sha,
             "after": a_sha,
-            # `redacted` (content withheld) is ORed in so the field is consistent with
-            # the abspath-based withhold decision (a .ssh/config sensitive only by a
-            # segment above cwd is redacted=True; is_sensitive(relative path) is False).
+            # `redacted` is ORed in so the field is consistent with the abspath-based
+            # classification (a .ssh/config sensitive only by a segment above cwd is
+            # redacted=True; is_sensitive(relative path) is False).
             "sensitive": is_sensitive(path) or target_sensitive or redacted,
             "redacted": redacted,
         }
         if external_change:
             rec["external_change"] = True
-        # Annotate a permission-only change (content unchanged) so the reader can
-        # show `chmod`-style mode transitions instead of an opaque 'modified'.
-        if (b_sha == a_sha and _meta(b, "mode") is not None
-                and _meta(a, "mode") is not None
+        # Annotate a mode transition (chmod) whenever both modes are known and
+        # differ -- INDEPENDENT of whether content also changed. Gating this on
+        # b_sha == a_sha dropped the permission change whenever a single tool call
+        # both edited a file and chmod'd it (the reader then lost the mode story).
+        if (_meta(b, "mode") is not None and _meta(a, "mode") is not None
                 and _meta(b, "mode") != _meta(a, "mode")):
             rec["mode_change"] = [_meta(b, "mode"), _meta(a, "mode")]
-        if unavailable:
-            # The renderer must print a notice instead of diffing against an empty
-            # blob (which fabricated a full deletion when 'after' was unreadable).
-            rec["content_unavailable"] = "large" if (b_large or a_large) else "unreadable"
+        # Sizes are part of the change-detection story `alog diff` renders -- but
+        # NOT for a sensitive/redacted file: the renderer suppresses everything
+        # beyond status there, so a recorded size would be stored-but-never-shown
+        # data that leaks a secret's byte length (a side channel on key type /
+        # token shape). Withhold it, mirroring what the renderer already hides.
+        if not redacted:
             rec["before_size"] = _meta(b, "size")
             rec["after_size"] = _meta(a, "size")
+        if unavailable:
+            # The renderer must print a notice instead of implying the digest
+            # comparison covered content it never read.
+            rec["content_unavailable"] = "large" if (b_large or a_large) else "unreadable"
             if b_large or a_large:
                 rec["large"] = True
         if is_bash:
@@ -1709,7 +1563,7 @@ def _snapshot(base: str, tool: str, tool_input: Dict, cwd: str, salt: bytes,
     just their named path (always fresh -- it is one file, so no cache needed)."""
     if tool == "Bash":
         return snapshot_tree(base, cwd, salt, session)
-    return snapshot_set(base, files_of_interest(tool, tool_input, cwd), cwd, salt)
+    return snapshot_set(files_of_interest(tool, tool_input, cwd), cwd, salt)
 
 
 def handle_pre(base: str, payload: Dict, tool: str, cwd: str, salt: bytes,

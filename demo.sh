@@ -14,7 +14,8 @@
 #   - the agent READING .env (git can NEVER show this)
 #   - a Bash command referencing a secret path (caught by command scan)
 #   - a binary file / a filename with spaces + non-ASCII
-#   - SECRET-AT-REST: the store must NOT contain the secret's bytes in cleartext
+#   - NO-BYTES-AT-REST: the store must NOT contain ANY file's bytes (v0.2+:
+#     salted digests + metadata only; there is no object store at all)
 #   - the store must carry its own .gitignore so it can't be committed
 #   - an ORPHAN Bash Pre (denied tool, no Post) must NOT poison a later Post
 #     into fabricating deletions of untouched files
@@ -185,8 +186,8 @@ printf 'TOKEN=rotatedsecret999\n' > "$WORK/config/secrets.env"
 emitb fix PostToolUse "echo done" bZ
 emitf fix PostToolUse Edit config/secrets.env eV
 
-# F4: secret-RECALL + at-rest. .dev.vars / *.tfvars (by name) and a private key
-# saved under an innocent name (by content sniff) must all stay OUT of the store.
+# F4: secret-RECALL by name (.dev.vars / *.tfvars) plus a private key under an
+# innocent name -- NO file's bytes ever land in the store (digests only).
 # (Write fires Pre -> the bytes hit disk -> Post, so these are 'added'.)
 emitf fix PreToolUse  Write .dev.vars d1
 printf 'API_TOKEN = topsecret_devvars_7777\n' > "$WORK/.dev.vars"
@@ -198,11 +199,8 @@ emitf fix PreToolUse  Write src/notes.txt n1
 printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nbody_keysecret_9999\n-----END OPENSSH PRIVATE KEY-----\n' > "$WORK/src/notes.txt"
 emitf fix PostToolUse Write src/notes.txt n1
 
-# F5: FALSE-POSITIVE allowlist. A clean .env.example (no KEY=value secret shape) and
-# a .pub public key must NOT be flagged AND their content must remain stored (diff
-# reconstructable). NOTE: a template that DOES carry a `KEY=value` (6+ char) line is
-# now withheld -- the placeholder exemption was removed because it kept leaking real
-# secrets; templates are in git anyway, so this is the fail-safe trade.
+# F5: FALSE-POSITIVE allowlist. A clean .env.example and a .pub public key must
+# NOT be flagged sensitive; their change is still recorded (digest + metadata).
 emitf fix PreToolUse  Write .env.example x1
 printf '# copy to .env and fill in your real values\n' > "$WORK/.env.example"
 emitf fix PostToolUse Write .env.example x1
@@ -240,9 +238,8 @@ emitf fix2 PreToolUse  Write docs/aws-setup.md awsdoc
 printf 'Set AWS_SECRET_ACCESS_KEY in CI before deploy.\n' > "$WORK/docs/aws-setup.md"
 emitf fix2 PostToolUse Write docs/aws-setup.md awsdoc
 
-# G3: L3 -- a template (.env.sample) is NOT sniff-exempt (only *.pub / public
-# certs are), so a REAL credential-shaped value left in it is WITHHELD, not stored
-# at rest. Copying .env to a template without stripping values must not leak.
+# G3: a credential value left in a template can never leak at rest -- no file
+# content is stored for ANY file (structural guarantee, v0.2+).
 emitf fix2 PreToolUse  Write deploy/.env.sample samp
 printf 'AWS_SECRET_ACCESS_KEY=EXAMPLEPLACEHOLDER0000000000\n' > "$WORK/deploy/.env.sample"
 emitf fix2 PostToolUse Write deploy/.env.sample samp
@@ -255,11 +252,6 @@ printf 'line1\nline2\nline3\n' > "$WORK/src/perm.txt"
 chmod 000 "$WORK/src/perm.txt"
 emitf fix2 PostToolUse Edit src/perm.txt gperm
 chmod 644 "$WORK/src/perm.txt"
-
-# G5: alog-3 -- a blob pruned from the store must render a notice, not a fake diff.
-emitf fix2 PreToolUse  Write src/pruned.txt gprune
-printf 'prunable content\n' > "$WORK/src/pruned.txt"
-emitf fix2 PostToolUse Write src/pruned.txt gprune
 
 # G6: alog-2 -- a Bash that BOTH names and writes a secret must be counted once.
 emitb fix2 PreToolUse  "echo x > c.env" gdbl
@@ -385,14 +377,17 @@ fail=0
 assert () { if grep -qF -- "$3" "$2"; then echo "  OK: $1"; else echo "  FAIL: $1 (missing: $3)"; fail=1; fi; }
 refute () { if grep -qF -- "$3" "$2"; then echo "  FAIL: $1 (should be absent: $3)"; fail=1; else echo "  OK: $1"; fi; }
 
-# core reconstruction
+# core change detection
 assert "S1 new file shown as added"              "$SHOW"  "A src/app.py"
 assert "S2 edit shown as modified"               "$SHOW"  "M config/app.yaml"
-assert "S3 opaque cmd: added file reconstructed" "$SHOW"  "A generated/report.txt"
-assert "S3 opaque cmd: deletion reconstructed"   "$SHOW"  "D src/old.tmp"
-assert "S4 diff reconstructs change (-)"         "$DIFF"  "-value = 'foo'"
-assert "S4 diff reconstructs change (+)"         "$DIFF"  "+value = 'bar'"
-assert "binary file marked, not dumped"          "$DIFF"  "Binary"
+assert "S3 opaque cmd: added file detected"      "$SHOW"  "A generated/report.txt"
+assert "S3 opaque cmd: deletion detected"        "$SHOW"  "D src/old.tmp"
+assert "S4 diff detects the script's change"     "$DIFF"  "modified: src/app.py"
+assert "S4 diff shows the size delta"            "$DIFF"  "bytes"
+refute "S4 diff never dumps content (-)"         "$DIFF"  "-value = 'foo'"
+refute "S4 diff never dumps content (+)"         "$DIFF"  "+value = 'bar'"
+assert "diff points at git for content"          "$DIFF"  "content is never stored"
+assert "binary file added, no bytes dumped"      "$DIFF"  "created: assets/logo.png"
 assert "unicode+space filename intact"           "$SHOW"  "日本語"
 
 # sensitive detection -- the git-can't-do-this view
@@ -407,12 +402,18 @@ refute "no false 'secret read' from Bash scan"   "$AUDIT" "bash READ .env"
 refute "token_bucket.py is NOT a secret"         "$AUDIT" "token_bucket"
 refute "backup.sshconfig is NOT a secret"        "$AUDIT" "sshconfig"
 
-# secret-at-rest: the store must not persist the secret's bytes in cleartext
-echo "  -- scanning $ALOG_DATA/objects for the cleartext secret --"
-if grep -rqF -- "$SECRET" "$ALOG_DATA/objects" 2>/dev/null; then
-  echo "  FAIL: cleartext secret found in the audit object store"; fail=1
+# no-bytes-at-rest: the WHOLE store must not persist the secret's bytes (v0.2+
+# there is no object store at all -- scan every file under the store).
+echo "  -- scanning the whole store for the cleartext secret --"
+if grep -rqF -- "$SECRET" "$ALOG_DATA" 2>/dev/null; then
+  echo "  FAIL: cleartext secret found in the audit store"; fail=1
 else
-  echo "  OK: secret bytes are NOT stored in cleartext (digest-only)"
+  echo "  OK: secret bytes are NOT stored anywhere (digest-only)"
+fi
+if [ -d "$ALOG_DATA/objects" ]; then
+  echo "  FAIL: an objects/ dir was created (the CAS must be gone)"; fail=1
+else
+  echo "  OK: no objects/ dir exists (no content storage tier)"
 fi
 assert ".alog ships its own .gitignore"          "$ALOG_DATA/.gitignore" "*"
 
@@ -431,9 +432,12 @@ python3 "$ALOG" --session fix diff  > "$DIFFF"
 python3 "$ALOG" --session fix audit > "$AUDITF"
 
 # F1/F2: structural checks straight off the NDJSON event log.
-python3 - "$NDJF" > "$WORK/checkf.txt" <<'PY'
-import json, sys, hashlib
-sha = lambda b: hashlib.sha256(b).hexdigest()
+python3 - "$NDJF" "$HERE/hook.py" "$ALOG_DATA" > "$WORK/checkf.txt" <<'PY'
+import json, sys, importlib.util
+spec = importlib.util.spec_from_file_location("hook", sys.argv[2])
+h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
+salt = h.get_salt(sys.argv[3])
+sha = lambda b: h.salted_digest(salt, b)          # all digests are salted (v0.2+)
 ev = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 def chg(e, p): return next((c for c in e.get("changes", []) if c.get("path") == p), None)
 def by_tuid(i): return next((e for e in ev if e.get("tool_use_id") == i), None)
@@ -468,11 +472,11 @@ assert "F2 concurrency caveat shown to user"       "$SHOWF" "attribution uncerta
 assert "F3 secret modification is surfaced"        "$AUDITF" "MODIFIED config/secrets.env"
 assert "F3 concurrency caveat shown for secret"    "$SHOWF" "attribution uncertain"
 
-# F4: secret recall + at-rest -- none of these bytes may sit in the store.
-echo "  -- scanning $ALOG_DATA/objects for recall/at-rest secrets --"
+# F4: no file's bytes may sit ANYWHERE in the store (there is no content tier).
+echo "  -- scanning the whole store for at-rest file bytes --"
 for s in topsecret_devvars_7777 tfvars_secret_8888 body_keysecret_9999 rotatedsecret999; do
-  if grep -rqF -- "$s" "$ALOG_DATA/objects" 2>/dev/null; then
-    echo "  FAIL: '$s' found in object store"; fail=1
+  if grep -rqF -- "$s" "$ALOG_DATA" 2>/dev/null; then
+    echo "  FAIL: '$s' found in the store"; fail=1
   else
     echo "  OK: '$s' is NOT at rest"
   fi
@@ -480,10 +484,12 @@ done
 assert "F4 .dev.vars flagged as a secret write"    "$AUDITF" "WROTE .dev.vars"
 assert "F4 *.tfvars flagged as a secret write"     "$AUDITF" "WROTE prod.tfvars"
 
-# F5: allowlist -- templates/public keys not flagged, content still diffable.
+# F5: allowlist -- templates/public keys not flagged sensitive; their change is
+# still recorded (digest + size), never their content.
 refute "F5 .env.example NOT flagged sensitive"     "$AUDITF" ".env.example"
 refute "F5 public .pub key NOT flagged sensitive"  "$AUDITF" "id_ed25519.pub"
-assert "F5 clean .env.example content stays stored" "$DIFFF" "fill in your real values"
+assert "F5 .env.example change still recorded"     "$DIFFF" "created: .env.example"
+refute "F5 template content not in the diff"       "$DIFFF" "fill in your real values"
 
 # F6: compound env-var secrets masked in the stored command string.
 assert "F6 command redaction applied"              "$NDJF" "<redacted>"
@@ -505,33 +511,27 @@ python3 "$ALOG" --session fix2 audit > "$AUDITG"
 # G1: reverse-order concurrency -- Edit owns the secret, Bash is NOT blamed.
 assert "G1 Edit owns the secret (reverse order)"   "$AUDITG" "MODIFIED config/g.env"
 refute "G1 Bash NOT blamed (posted-overlap caught)" "$AUDITG" "bash MODIFIED config/g.env"
-# G2: a doc that only NAMES the AWS var keeps its content (sniff needs a value now).
-assert "G2 doc naming AWS var keeps content"       "$DIFFG" "Set AWS_SECRET_ACCESS_KEY in CI"
+# G2: a doc that merely NAMES the AWS var is not flagged sensitive.
+assert "G2 doc change recorded"                    "$DIFFG" "created: docs/aws-setup.md"
 refute "G2 doc is not flagged sensitive"           "$AUDITG" "aws-setup.md"
-# G3: a template with a REAL credential-shaped value is now WITHHELD, not stored.
-refute "G3 template real-secret value NOT stored"  "$DIFFG" "EXAMPLEPLACEHOLDER0000000000"
-assert "G3 template shown withheld (not stored)"   "$DIFFG" "sensitive -- content not stored"
+# G3: a template's value never lands at rest (nothing is stored for any file).
+refute "G3 template value NOT anywhere in diff"    "$DIFFG" "EXAMPLEPLACEHOLDER0000000000"
+if grep -rqF -- "EXAMPLEPLACEHOLDER0000000000" "$ALOG_DATA" 2>/dev/null; then
+  echo "  FAIL: G3 template value found in the store"; fail=1
+else
+  echo "  OK: G3 template value is NOT at rest"
+fi
 # G4: unreadable after-snapshot -> notice, not a fabricated deletion.
-assert "G4 unreadable shows a notice"              "$DIFFG" "content unavailable (unreadable"
+assert "G4 unreadable shows a notice"              "$DIFFG" "unreadable at snapshot"
 refute "G4 unreadable does NOT fake-delete line1"  "$DIFFG" "-line1"
 # G6: a Bash naming+writing a secret is counted once (no CMD-REF duplicate).
 assert "G6 secret write reported once"             "$AUDITG" "WROTE c.env"
 refute "G6 no duplicate CMD-REF for same secret"   "$AUDITG" "CMD-REF c.env"
 
-# G5 (pruned blob) + G7 (perms) + ReDoS timing: structural checks in python.
+# G7 (perms) + ReDoS timing + cas-4: structural checks in python.
 python3 - "$ALOG_DATA" "$ALOG" "$WORK" "$HERE/hook.py" > "$WORK/checkg.txt" <<'PY'
 import sys, os, json, hashlib, subprocess, time, importlib.util
 data, alog, work, hookpath = sys.argv[1:5]
-
-# G5: prune the blob backing src/pruned.txt, then diff must say 'missing/pruned'.
-sha = hashlib.sha256(b"prunable content\n").hexdigest()
-obj = os.path.join(data, "objects", sha[:2], sha)
-if os.path.exists(obj):
-    os.remove(obj)
-out = subprocess.run([sys.executable, alog, "--session", "fix2", "diff", "src/pruned.txt"],
-                     env=dict(os.environ, ALOG_DATA=data), capture_output=True, text=True).stdout
-if "object missing or pruned" in out and "+prunable content" not in out:
-    print("G5_pruned_blob_notice_OK")
 
 # G7: session ndjson and pending json must be 0600 (not umask 0644).
 bad = []
@@ -589,7 +589,6 @@ print("CAS4_warm_reuse_OK" if cold_n >= 5 and warm_n == 0
 
 # cas-4: two cwds in one session must record their OWN content (abspath key),
 # never cross-substitute on a same-relative-name collision.
-import hashlib as _hl
 ca = os.path.join(work, "cwa"); cb = os.path.join(work, "cwb")
 os.makedirs(ca, exist_ok=True); os.makedirs(cb, exist_ok=True)
 open(os.path.join(ca, "VERSION"), "w").write("1.0.0\n")
@@ -599,8 +598,8 @@ def _sha(snap, name):
     r = next((v for k, v in snap.items() if os.path.basename(k) == name and v), None)
     return r.get("sha") if r else None
 print("CAS4_xcwd_OK"
-      if _sha(sa, "VERSION") == _hl.sha256(b"1.0.0\n").hexdigest()
-      and _sha(sb, "VERSION") == _hl.sha256(b"2.0.0\n").hexdigest()
+      if _sha(sa, "VERSION") == h.salted_digest(salt, b"1.0.0\n")
+      and _sha(sb, "VERSION") == h.salted_digest(salt, b"2.0.0\n")
       else "CAS4_xcwd_FAIL sa={0} sb={1}".format(list(sa), list(sb)))
 
 # sc-2 fail-safe: the reverted doc carve-out must NOT make secrets.md storable.
@@ -610,7 +609,6 @@ print("SC2_failsafe_OK"
       and h.is_sensitive(".ssh/secret.md")
       else "SC2_failsafe_FAIL")
 PY
-assert "G5 pruned blob renders a notice"            "$WORK/checkg.txt" "G5_pruned_blob_notice_OK"
 assert "G7 sessions/pending files are 0600"         "$WORK/checkg.txt" "G7_store_files_0600_OK"
 assert "ReDoS: redaction is bounded (<3s on 40KB)"  "$WORK/checkg.txt" "REDOS_bounded_OK"
 

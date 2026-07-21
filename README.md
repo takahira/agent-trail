@@ -4,8 +4,8 @@
 
 Records what your Claude Code agent actually did — opaque `Bash` effects, the
 secrets it *read*, what it was *asked*, and per-turn token cost — using nothing
-but hooks, NDJSON, and a content-addressed store. No cloud, no daemon, no
-dependencies.
+but hooks and an NDJSON log of **salted content digests + metadata** (file
+contents are never stored). No cloud, no daemon, no dependencies.
 
 [![CI](https://github.com/takahira/agent-trail/actions/workflows/ci.yml/badge.svg)](https://github.com/takahira/agent-trail/actions/workflows/ci.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -22,9 +22,9 @@ You let an agent loose on your repo. Afterwards, `git diff` tells you which
 1. **What an opaque `Bash` command actually changed.** When the agent runs
    `sh ./gen.sh` — a command string that names no file — `git diff` shows the
    result but not the cause. agent-trail snapshots the work-tree's content
-   hashes *before* and *after* each tool via `PreToolUse`/`PostToolUse`, so it
-   reconstructs the added / modified / deleted files even though the command
-   never named them.
+   digests *before* and *after* each tool via `PreToolUse`/`PostToolUse`, so it
+   detects and attributes the added / modified / deleted files even though the
+   command never named them.
 
 2. **Which secrets the agent merely read.** If the agent `Read`s your `.env`,
    git leaves **no trace at all** — reading a file changes nothing. The hook
@@ -104,7 +104,7 @@ Environment:
 ```sh
 python3 alog.py sessions                 # list recorded sessions
 python3 alog.py show                     # git-status-like timeline of the session
-python3 alog.py diff                     # git-diff-like before/after for every change
+python3 alog.py diff                     # change detection (status/size/mode) per change
 python3 alog.py diff src/app.py          # one file
 python3 alog.py audit                    # ONLY the sensitive-file accesses
 python3 alog.py audit --fail-on-hit      # exit 2 if any secret was accessed (CI / pre-commit)
@@ -137,18 +137,17 @@ Common flags (before or after the subcommand):
 summary: 13 events, 7 file change(s), 3 sensitive access(es)
 ```
 
-`alog diff` reconstructs the actual before/after even for a change made by an
-opaque script:
+`alog diff` detects what changed — status, size delta, mode change — even for a
+change made by an opaque script. Content hunks are deliberately not available
+(file contents are never stored); for tracked files, `git diff` has the content
+story:
 
 ```text
 diff --alog [#04 Bash] src/app.py
---- a/src/app.py
-+++ b/src/app.py
-@@ -1,2 +1,3 @@
--value = 'foo'
-+value = 'bar'
- print(value)
-+# touched
+modified: src/app.py  (23 -> 33 bytes, +10)
+
+note: file content is never stored (salted digests + metadata only);
+      for tracked files, `git diff` / `git log -p` has the content story.
 ```
 
 Prompts and token/cost events are woven into the same `seq`-ordered timeline, and
@@ -176,58 +175,59 @@ Prompts and token/cost events are woven into the same `seq`-ordered timeline, an
   for sequential calls and silently breaks under concurrency; the `tool_use_id`
   key is what makes it correct.)
 - **Single-file tools** snapshot just the one path; **`Bash`** snapshots the
-  whole work-tree by content hash (reusing an mtime manifest so it stays cheap),
-  which is how it reconstructs changes a command string never named.
-- **The store is content-addressed.** File contents are keyed by hash so `diff`
-  can rebuild any before/after state offline. Nothing leaves your machine.
+  whole work-tree by content digest (reusing an mtime manifest so it stays cheap),
+  which is how it detects changes a command string never named.
+- **Digests + metadata only.** Every file is recorded as a **salted, truncated
+  digest** plus size / mode / timestamps — file bytes are never written anywhere.
+  Digests are only ever compared for before/after equality, which is all change
+  detection needs. Nothing leaves your machine.
 
 ## Security posture — the audit tool must not become the leak
 
-The whole point collapses if the store itself becomes a plaintext secret dump. Two
-things are worth being precise about — **a hard guarantee** and **a best-effort
-one** — because secret *detection* is heuristic and no regex can prove arbitrary
-file content secret-free:
+The store's security story is one sentence:
 
-- **Hard guarantee — a *detected* secret is never stored as cleartext.** Anything
-  classified sensitive — by name (`.env`, `*.pem`, `.ssh/…`, `*.tfvars`,
-  `serviceAccountKey.json`, …) **or** by a content sniff of the **whole stored
-  content** (private-key headers; cloud-credential shapes; vendor tokens incl.
-  GitHub `gh*_`, Google `AIza`, Slack `xox*`/`xapp-`; quoted **and** unquoted config
-  secrets; `scheme://user:pass@host` connection strings — every byte that would be
-  persisted, not just a head window) — is recorded as a **salted digest** only, its
-  bytes never written to the object store. Only *structurally public* content (a
-  `*.pub` / public-cert name **whose bytes actually start as** `ssh-…` /
-  `-----BEGIN CERTIFICATE-----`) skips the broad sniff; env/vars **templates**
-  (`.env.example`, …) keep it, so a real secret left in a template is withheld while
-  a clean placeholder template still stores its bytes so the diff stays viewable.
-- **Best-effort — an *undetected* secret can be stored.** The classifiers are
-  precise, not exhaustive: a secret in an unusual shape, a novel vendor prefix, or
-  a value the sniff doesn't recognise **can** be written into `.alog/objects` as
-  part of an otherwise-innocuous file's content. So treat the store as sensitive:
+- **File contents are never stored, period.** Every file — secret or not — is
+  recorded as a *keyed* (HMAC-SHA256), truncated digest plus metadata. The
+  per-store random key means a digest seen **without** the store — a log line
+  pasted elsewhere, a cross-store rainbow table — cannot be matched back to
+  guessed content. It is **not** a defence once someone has the whole `.alog/`:
+  the key lives in it beside the digests, so treat the store as sensitive.
+  Sensitive files additionally record **no size**, so a secret's byte length
+  isn't disclosed either. (Before v0.2 an object store held non-sensitive file
+  bytes for content diffs; that entire storage tier — and the class of at-rest
+  risk that came with it — was removed. A legacy `.alog/objects/` directory is
+  dead weight and can be deleted.)
+
+What still lands in the log, and its guardrails:
+
+- **`Bash` command strings and your prompts ARE stored** — that is the audit's
+  job. Inline secrets in commands (`API_KEY=…`, Bearer tokens, `sk-…`,
+  `user:pass@host`, `--password …`, `sshpass -p …`) and prompts (PEM blocks,
+  vendor tokens, JWTs, URL credentials) are masked before storage — best-effort
+  (short/novel credential flags and free-form prose can slip).
+- **A secret embedded in a filename / path** is recorded as part of the path
+  (paths are needed for change correlation); symlink *targets* are additionally
+  passed through the command redactor.
 - **The store is created `0700`/`0600` and drops its own `.gitignore(*)`**, so it
-  can't be accidentally committed or read by other local users. That defense-in-depth
-  is what backstops the best-effort detection above — **do not** copy `.alog/`
-  elsewhere, relax its permissions, or treat it as safe to share.
-- **Inline secrets in `Bash` command strings** (`API_KEY=…`, Bearer tokens, `sk-…`,
-  `user:pass@host`, `--password …`, `sshpass -p …`) are masked before storage —
-  again best-effort (short/novel credential flags and free-form prose can slip).
-- **Prompt redaction** masks known shapes (PEM private-key blocks, `API_KEY=`,
-  Bearer, `sk-`, Stripe `sk_live_`, JWTs, URL credentials) before writing — an
-  effort, not a guarantee (see Limitations).
+  can't be accidentally committed or read by other local users. Treat `.alog/`
+  as sensitive anyway — it holds your command history and prompts.
 
 ## Limitations
 
 Honest scope — this records a lot, but not everything:
 
+- **No content view.** `alog diff` shows change detection (status, size delta,
+  mode change), not content hunks — file bytes are never stored. For a
+  git-tracked file, `git diff` has the content; for untracked/ignored files the
+  *fact and attribution* of the change is recorded, but the bytes are gone.
 - **Read-only tools other than `Read` are not audited.** `Grep` / `Glob` /
   `WebFetch` are out of scope; only `Write` / `Edit` / `Read` / `NotebookEdit` /
   `MultiEdit` and `Bash` are recorded.
-- **Secret *detection* is best-effort (see Security posture).** A DETECTED secret
-  is digest-only (hard guarantee), but the classifiers are precise, not exhaustive:
-  an unrecognised shape/prefix, an unusual config value, or a secret embedded in a
-  **filename / path / symlink target** (paths are recorded verbatim for change
-  correlation) can end up stored in the log or CAS. The `0700`/`.gitignore` store is
-  the backstop — treat `.alog/` as sensitive.
+- **Sensitive classification is name/path-based and best-effort.** The "agent
+  read `.env`" headline relies on a precise-but-not-exhaustive name heuristic;
+  a secret in an unusually-named file is still recorded as an access, just not
+  flagged sensitive. (Nothing is at risk at rest either way — contents are never
+  stored.)
 - **Prompt redaction is best-effort.** It masks known secret *shapes*; a secret
   with no recognizable shape in free text can slip through — an effort, not a
   guarantee.
@@ -255,15 +255,16 @@ Honest scope — this records a lot, but not everything:
   same tree get independent sessions with no cross-session lock, so a change made
   by session B can be attributed `exclusive` in session A's log. Run one session
   per work tree if you need exact attribution.
-- **`Bash` changes under build/VCS dirs aren't reconstructed.** The whole-tree
+- **`Bash` changes under build/VCS dirs aren't detected.** The whole-tree
   snapshot skips `.git`, `node_modules`, `dist`, `build`, `target`, `.venv`, … for
   speed, so a `Bash` write to e.g. `.git/hooks/pre-commit` or `dist/bundle.js`
   produces no file-change record (the *command string* is still captured and
   secret-scanned). A `Write`/`Edit` to the same path **is** recorded, since
   single-file tools snapshot the named path directly.
-- **Retention / GC is not implemented.** Non-sensitive blobs, command strings,
-  prompts, and turn events accumulate without bound (the pending stack alone is
-  TTL- and length-capped).
+- **Retention / GC is not implemented.** Command strings, prompts, and turn
+  events accumulate without bound (the pending stack alone is TTL- and
+  length-capped). With no content storage the growth is text-sized, not
+  workspace-sized.
 - **Claude Code only, for now.** The hook understands Claude Code's
   Pre/PostToolUse / UserPromptSubmit / Stop payloads and transcript format;
   other agents' formats are not yet supported.
@@ -279,7 +280,7 @@ Two test layers, both standard-library only:
 python3 -m unittest discover -s tests -p "test_*.py" -t .
 
 # Integration demo + assertions (synthesizes hook payloads into a throwaway
-# /tmp git repo and asserts the reconstructed audit log end-to-end)
+# /tmp git repo and asserts the recorded audit log end-to-end)
 bash demo.sh
 ```
 

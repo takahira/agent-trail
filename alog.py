@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 """alog -- read the agent audit log produced by hook.py.
 
-Reads the local NDJSON event log + content-addressed store and reconstructs,
-fully offline:
+Reads the local NDJSON event log and reports, fully offline:
 
   alog show       a git-status-like timeline of what the agent did
-  alog diff       a git-diff-like before/after for every changed file
+  alog diff       change detection (status / size delta / mode) per changed file
   alog audit      ONLY the sensitive-file accesses (the view git cannot give you)
   alog cost       per-model token usage + estimated cost for the session
   alog sessions   list recorded sessions
@@ -16,19 +15,18 @@ The timeline also carries two non-tool event kinds git never sees: ``prompt``
 ``cost`` derives dollars from the recorded tokens and the MODEL_PRICING table in
 this file -- a rough estimate, not a billing source; tokens are the ground truth.
 
-The point: `diff` reconstructs file changes from observed content
-hashes -- so it sees what a Bash `sed -i` / `rm` changed even though the command
-string never named the file -- and `audit` surfaces reads of secrets, which
-leave no git trace at all. Sensitive files are recorded as access + salted
-digest only (content is never stored), so `diff` reports them as
-"[sensitive -- content not stored]" rather than printing the secret.
+The point: the hook detects what changed from observed content DIGESTS -- so
+`diff` sees what a Bash `sed -i` / `rm` changed even though the command string
+never named the file -- and `audit` surfaces reads of secrets, which leave no
+git trace at all. File CONTENT is never stored (v0.2+: salted digests +
+metadata only), so `diff` shows change detection, not content hunks; for a
+git-tracked file, `git diff` has the content story.
 
 Python 3.9 compatible; standard library only.
 """
 from __future__ import annotations
 
 import argparse
-import difflib
 import json
 import math
 import os
@@ -39,7 +37,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 # Single source of truth for the package version (read by pyproject.toml).
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 STATUS_LETTER = {"added": "A", "modified": "M", "deleted": "D", "read": "R",
                  "present": "?", "missing": "!", "typechange": "T"}
@@ -242,60 +240,6 @@ def load_events(base: str, session: Optional[str]) -> List[Dict]:
     return events
 
 
-_OBJ_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
-_READ_BLOB_CAP = 10 * 1024 * 1024 + 1
-
-
-def read_blob(base: str, sha: Optional[str]) -> Optional[bytes]:
-    # Require a real 64-hex object id BEFORE building a path: a tampered log with
-    # `"after":"../../etc/passwd"` (or an absolute path) would otherwise escape the
-    # store via os.path.join and disclose an arbitrary file into the diff output; a
-    # crafted `/dev/zero` would read unbounded. Hex-validate, open O_NOFOLLOW, require
-    # a regular file, and cap the read. ('S:' sensitive digests carry no blob.)
-    if not isinstance(sha, str) or sha.startswith("S:") or not _OBJ_SHA_RE.match(sha):
-        return None
-    path = os.path.join(base, "objects", sha[:2], sha)
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
-        return None
-    try:
-        with os.fdopen(fd, "rb") as fh:
-            st = os.fstat(fh.fileno())
-            if not stat.S_ISREG(st.st_mode):
-                return None
-            return fh.read(_READ_BLOB_CAP)
-    except OSError:
-        return None
-
-
-def to_lines(content: Optional[bytes]) -> Tuple[List[str], bool, bool]:
-    """Return (lines, is_binary, no_final_newline).
-
-    Splits ONLY on '\\n' (keeping the newline) so lone '\\r' and exotic Unicode
-    line separators are not treated as line breaks (difflib would otherwise
-    miscount). Tracks whether the last line lacked a trailing newline.
-    """
-    if content is None:
-        return [], False, False
-    if b"\x00" in content:
-        return [], True, False
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        return [], True, False
-    if text == "":
-        return [], False, False
-    parts = text.split("\n")
-    no_final_nl = parts[-1] != ""
-    if not no_final_nl:
-        parts = parts[:-1]  # drop the empty trailing element after final '\n'
-    lines = [p + "\n" for p in parts]
-    if no_final_nl and lines:
-        lines[-1] = lines[-1][:-1]  # last line keeps no newline
-    return lines, False, no_final_nl
-
-
 # ---- formatting ----------------------------------------------------------
 
 def fmt_time(ts, show_time: bool) -> str:
@@ -374,12 +318,11 @@ def render_nontool(ev: Dict, show_time: bool, multi: bool) -> str:
 def is_agent_sensitive(ev: Dict, change: Dict) -> bool:
     """A sensitive access we attribute to the agent.
 
-    'Sensitive' here means the name/path heuristic flagged it (change['sensitive'])
-    OR the content sniff withheld it (change['redacted']): a name-innocuous file
-    whose BYTES are a real secret (e.g. notes.txt holding a GitHub token) is
-    withheld from the store but must still surface in `alog audit` / the ⚠ marker /
-    --fail-on-hit -- otherwise the audit reports a false all-clear for exactly the
-    recall-gap case the content sniff exists to cover.
+    'Sensitive' here means the name/path heuristic flagged it: change['sensitive']
+    (which ORs in symlink-target sensitivity) or the hook-side 'redacted' flag.
+    Both are honoured so an event written by any hook version -- including v0.1
+    logs where 'redacted' could also mean a content-sniff hit -- keeps surfacing
+    in `alog audit` / the ⚠ marker / --fail-on-hit.
 
     A Bash command snapshots the whole work tree, so an UNCHANGED sensitive file
     seen there was hashed by us, not deliberately read by the agent -- counting
@@ -551,19 +494,36 @@ def cmd_show(base: str, session: Optional[str], show_time: bool) -> int:
     return 0
 
 
-def render_one_diff(base: str, ev: Dict, change: Dict) -> List[str]:
+def _size_int(v) -> Optional[int]:
+    """A recorded size as an int, or None for anything else (tampered log)."""
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def render_one_diff(ev: Dict, change: Dict) -> List[str]:
+    """Change-detection record for one change: status, size delta, mode change.
+
+    No content hunks: the hook stores salted digests + metadata only (v0.2+),
+    never file bytes. For a git-tracked file `git diff` has the content story;
+    what this view adds is changes by opaque Bash commands, untracked/ignored
+    files, and sensitive accesses."""
     path = _safe_inline(change.get("path"))  # sanitized once; used in every header below
     status = change.get("status")
     out = ["diff --alog [#{0:02d} {1}] {2}".format(
         _seq(ev), _safe_inline(ev.get("tool") or "?"), path)]
 
-    # A salted digest ('S:') means content was deliberately withheld. Honour it
-    # even if the 'redacted' flag is somehow absent, so we never diff against an
-    # empty side and fabricate an add/delete for a sensitive file (belt + braces).
-    if change.get("redacted") or str(change.get("before") or "").startswith("S:") \
+    # A sensitive change is reported as an access, with NO metadata beyond the
+    # status -- in particular no size, so a secret's byte length is never shown.
+    # This must fire for EVERY sensitive record, not just redacted/'S:' ones: a
+    # sensitive-by-path non-regular record (e.g. an added `.env` symlink, or a
+    # target-sensitive alias) carries `sensitive=True` but neither `redacted` nor
+    # an `S:` digest (its sha is None), and would otherwise fall through to the
+    # size-disclosing branches below and print `created: .env (0 bytes)`.
+    if change.get("redacted") or change.get("sensitive") \
+            or str(change.get("before") or "").startswith("S:") \
             or str(change.get("after") or "").startswith("S:"):
         verb = {"added": "created", "modified": "modified",
-                "deleted": "deleted"}.get(status, "touched")
+                "deleted": "deleted"}.get(status if isinstance(status, str) else None,
+                                          "touched")
         out.append("[sensitive -- content not stored; {0}, access recorded]".format(verb))
         return out
     if status == "typechange":
@@ -576,60 +536,30 @@ def render_one_diff(base: str, ev: Dict, change: Dict) -> List[str]:
             _safe_inline(str(change.get("after_size")))))
         return out
     if cu == "unreadable":
-        out.append("content unavailable (unreadable at snapshot time): {0}".format(path))
+        out.append("unreadable at snapshot time (change detected via stat): {0}".format(path))
         return out
 
-    before_b = read_blob(base, change.get("before"))
-    after_b = read_blob(base, change.get("after"))
-    # A non-digest sha that resolves to no blob means the object is missing/pruned.
-    # Diffing against an empty side would FABRICATE a full add/delete, so bail out
-    # with a notice instead.
-    def _missing(sha, blob):
-        # isinstance guard: a tampered change with `"before": 123` would otherwise
-        # raise AttributeError on 123.startswith and abort the whole diff command.
-        return isinstance(sha, str) and bool(sha) and not sha.startswith("S:") and blob is None
-    if _missing(change.get("before"), before_b) or _missing(change.get("after"), after_b):
-        out.append("content unavailable (object missing or pruned from store): {0}".format(path))
-        return out
-    b_lines, b_bin, b_nonl = to_lines(before_b)
-    a_lines, a_bin, a_nonl = to_lines(after_b)
-
+    b_size = _size_int(change.get("before_size"))
+    a_size = _size_int(change.get("after_size"))
     if status == "added":
-        out.append("new file: {0}".format(path))
-        if a_bin:
-            out.append("Binary file {0} added".format(path)); return out
+        line = "created: {0}".format(path)
+        if a_size is not None:
+            line += "  ({0:,} bytes)".format(a_size)
     elif status == "deleted":
-        out.append("deleted file: {0}".format(path))
-        if b_bin:
-            out.append("Binary file {0} deleted".format(path)); return out
-    elif b_bin or a_bin:
-        out.append("Binary files differ: {0}".format(path)); return out
-
-    diff = list(difflib.unified_diff(b_lines, a_lines,
-                                     fromfile="a/" + path, tofile="b/" + path, lineterm=""))
-    # Attach the "no newline" marker to the SPECIFIC side that lacks it, right
-    # after that side's last line (git's behaviour) -- not once at the very end,
-    # which implied the wrong side and under-reported when both sides lacked it.
-    # unified_diff yields the --- / +++ headers first (idx 0,1); '@@' are hunks.
-    last_before = last_after = -1
-    for i, l in enumerate(diff):
-        if i < 2 or l.startswith("@@ "):
-            continue
-        if l[:1] in (" ", "-"):
-            last_before = i
-        if l[:1] in (" ", "+"):
-            last_after = i
-    marker = "\\ No newline at end of file"
-    inserts = {}
-    if b_nonl and last_before >= 0:
-        inserts.setdefault(last_before, []).append(marker)
-    # If both sides end on the SAME (context) line, git emits one marker only.
-    if a_nonl and last_after >= 0 and not (b_nonl and last_after == last_before):
-        inserts.setdefault(last_after, []).append(marker)
-    for i, l in enumerate(diff):
-        out.append(_safe(l.rstrip("\n")))   # diff body is file content -> sanitize
-        for m in inserts.get(i, []):
-            out.append(m)
+        line = "deleted: {0}".format(path)
+        if b_size is not None:
+            line += "  (was {0:,} bytes)".format(b_size)
+    else:
+        line = "modified: {0}".format(path)
+        if b_size is not None and a_size is not None:
+            delta = a_size - b_size
+            line += "  ({0:,} -> {1:,} bytes, {2}{3:,})".format(
+                b_size, a_size, "+" if delta >= 0 else "", delta)
+    out.append(line)
+    mc = change.get("mode_change")
+    if isinstance(mc, list) and len(mc) == 2 \
+            and all(isinstance(m, int) and not isinstance(m, bool) for m in mc):
+        out.append("mode: {0:o} -> {1:o}".format(mc[0], mc[1]))
     return out
 
 
@@ -642,13 +572,16 @@ def cmd_diff(base: str, session: Optional[str], only_path: Optional[str]) -> int
                 continue
             if only_path and c.get("path") != only_path:
                 continue
-            for line in render_one_diff(base, ev, c):
+            for line in render_one_diff(ev, c):
                 print(line)
             print()
             printed += 1
     if printed == 0:
         print("no file changes recorded"
               + (" for {0}".format(only_path) if only_path else ""))
+    else:
+        print("note: file content is never stored (salted digests + metadata only);")
+        print("      for tracked files, `git diff` / `git log -p` has the content story.")
     return 0
 
 

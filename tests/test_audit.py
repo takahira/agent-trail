@@ -44,12 +44,6 @@ def sha(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _redos_probe(payload: bytes) -> None:
-    """Subprocess target: run the content sniff so a hang can be terminated
-    (a thread cannot -- re.search holds the GIL for the whole scan)."""
-    hook.content_looks_secret(payload)
-
-
 # ===========================================================================
 # Pure classifiers / redaction (no filesystem)
 # ===========================================================================
@@ -102,34 +96,6 @@ class TestSensitiveClassification(unittest.TestCase):
     def test_value_bearing_secret_files(self):
         self.assertTrue(hook.is_sensitive("secret.json"))
         self.assertTrue(hook.is_sensitive("secrets.yaml"))
-
-
-class TestContentSniff(unittest.TestCase):
-    def test_private_key_header(self):
-        self.assertTrue(hook.content_looks_secret(b"-----BEGIN OPENSSH PRIVATE KEY-----\nx"))
-        self.assertTrue(hook.content_looks_secret(b"-----BEGIN RSA PRIVATE KEY-----"))
-
-    def test_cloud_credential_shapes(self):
-        self.assertTrue(hook.content_looks_secret(b"AKIAIOSFODNN7EXAMPLE0"))
-        self.assertTrue(hook.content_looks_secret(b"ghp_" + b"a" * 30))
-
-    def test_aws_key_requires_value(self):
-        # sc-1/REG-1: a mere mention of the env name must NOT trip the sniff.
-        self.assertFalse(hook.content_looks_secret(b"Set AWS_SECRET_ACCESS_KEY in CI"))
-        self.assertTrue(hook.content_looks_secret(
-            b"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfi"))
-
-    def test_plain_text_is_not_secret(self):
-        self.assertFalse(hook.content_looks_secret(b"hello world\nlprint(1)\n"))
-
-    def test_pgp_private_key_block(self):
-        # PGP armor uses the " BLOCK" suffix -- it must be caught (atrest-pgp).
-        pgp = b"-----BEGIN PGP PRIVATE KEY BLOCK-----\nxyz\n"
-        self.assertTrue(hook.content_has_private_key(pgp))
-        self.assertTrue(hook.content_looks_secret(pgp))
-        # but public/cert armor must NOT be treated as a private key
-        self.assertFalse(hook.content_has_private_key(b"-----BEGIN CERTIFICATE-----\nx"))
-        self.assertFalse(hook.content_has_private_key(b"-----BEGIN PGP PUBLIC KEY BLOCK-----\nx"))
 
 
 class TestRedaction(unittest.TestCase):
@@ -216,7 +182,7 @@ class TestSafeSession(unittest.TestCase):
 
 
 # ===========================================================================
-# Filesystem-backed: CAS, snapshots, manifest
+# Filesystem-backed: digests, snapshots, manifest
 # ===========================================================================
 
 class StoreTestCase(unittest.TestCase):
@@ -246,22 +212,22 @@ class StoreTestCase(unittest.TestCase):
             fh.write(content if isinstance(content, bytes) else content.encode())
         return p
 
+    def dg(self, content, sensitive=False):
+        """Expected salted digest for content under this store's salt."""
+        return hook.salted_digest(self.salt, content, sensitive)
 
-class TestCAS(StoreTestCase):
-    def test_store_blob_roundtrip(self):
-        s = hook.store_blob(self.base, b"hello\n")
-        self.assertEqual(s, sha(b"hello\n"))
-        obj = os.path.join(self.base, "objects", s[:2], s)
-        self.assertTrue(os.path.exists(obj))
-        with open(obj, "rb") as fh:
-            self.assertEqual(fh.read(), b"hello\n")
+    def store_contains(self, needle):
+        """True if any file under the store contains the byte needle -- the
+        no-content-at-rest invariant check (must always be False for file bytes)."""
+        for dp, _, files in os.walk(self.base):
+            for f in files:
+                with open(os.path.join(dp, f), "rb") as fh:
+                    if needle in fh.read():
+                        return True
+        return False
 
-    def test_store_blob_leaves_no_tmp(self):
-        # cas-1: unique tmp + cleanup, no orphan .tmp.
-        hook.store_blob(self.base, b"data")
-        objdir = os.path.join(self.base, "objects", sha(b"data")[:2])
-        self.assertFalse(any(n.endswith(".tmp") for n in os.listdir(objdir)))
 
+class TestDigests(StoreTestCase):
     def test_salt_is_stable_and_16_bytes(self):
         # cas-2: idempotent, always >=16 bytes.
         self.assertEqual(len(self.salt), 16)
@@ -272,72 +238,106 @@ class TestCAS(StoreTestCase):
         self.assertTrue(d.startswith("S:"))
         self.assertNotEqual(d, "S:" + sha(b"topsecret")[:16])  # salted, not plain
 
+    def test_all_digests_salted_no_plain_sha_oracle(self):
+        # Issue #2: EVERY digest is salted, so no recorded value equals a plain
+        # sha256(content) an attacker could precompute offline.
+        d = hook.salted_digest(self.salt, b"known public content")
+        self.assertTrue(d.startswith("D:"))
+        self.assertNotIn(sha(b"known public content")[:16], d)
+
+    def test_no_objects_dir_created(self):
+        # Issue #2: the CAS is gone -- ensure_dirs must not create objects/.
+        self.assertFalse(os.path.exists(os.path.join(self.base, "objects")))
+
+    def test_digest_is_hmac_not_concatenation(self):
+        # #3 T1-1: the digest is HMAC(salt, content), NOT sha256(salt+content).
+        # A plain concatenation is boundary-ambiguous (sha256(A+B) with unknown
+        # split), which enabled the salt-extension change-hiding attack.
+        import hmac as _hmac
+        import hashlib as _hl
+        expect = "D:" + _hmac.new(self.salt, b"payload", _hl.sha256).hexdigest()[:16]
+        self.assertEqual(hook.salted_digest(self.salt, b"payload"), expect)
+        self.assertNotEqual(
+            hook.salted_digest(self.salt, b"payload"),
+            "D:" + _hl.sha256(self.salt + b"payload").hexdigest()[:16])
+
+    def test_oversized_salt_is_healed_to_16(self):
+        # #3 T1-1: a hostile append to .alog/salt (excluded from Bash snapshots)
+        # must NOT be honoured -- get_salt heals any non-16-byte salt back to 16.
+        with open(os.path.join(self.base, "salt"), "ab") as fh:
+            fh.write(b"EXTRA")                       # now 21 bytes
+        healed = hook.get_salt(self.base)
+        self.assertEqual(len(healed), 16)
+        self.assertEqual(os.path.getsize(os.path.join(self.base, "salt")), 16)
+
+    def test_salt_extension_change_is_not_hidden(self):
+        # #3 T1-1 end-to-end: the salt-extension attack (append a file's prefix to
+        # the salt, strip it from the file so digests collide) must surface as a
+        # modification, not a silent 'read'. Two guards catch it: get_salt heals
+        # the oversized salt, AND build_changes flags digest-equal-but-size-diff.
+        work = os.path.join(self.tmp, "sew"); os.makedirs(work)
+        fp = os.path.join(work, "f.txt")
+        with open(fp, "wb") as fh:
+            fh.write(b"XSECRET")
+        before = hook.snapshot_file(fp, self.salt, False)
+        with open(os.path.join(self.base, "salt"), "ab") as fh:
+            fh.write(b"X")
+        salt2 = hook.get_salt(self.base)
+        with open(fp, "wb") as fh:
+            fh.write(b"SECRET")
+        after = hook.snapshot_file(fp, salt2, False)
+        ch = hook.build_changes({"f.txt": before}, {"f.txt": after}, True, None)[0]
+        self.assertEqual(ch["status"], "modified")
+
+    def test_size_mismatch_tripwire(self):
+        # #3 T1-1 belt+braces: equal digest but different size on a regular file is
+        # impossible for an honest keyed hash -> forced 'modified', never 'read'.
+        b = {"sha": "D:aaaa", "size": 8, "mode": 0o644}
+        a = {"sha": "D:aaaa", "size": 7, "mode": 0o644}
+        self.assertEqual(hook.build_changes({"x": b}, {"x": a}, True, None)[0]["status"],
+                         "modified")
+
 
 class TestSnapshotFile(StoreTestCase):
-    def test_regular_file_stored(self):
+    def test_regular_file_digest_only(self):
         p = self.wf("a.txt", b"content\n")
-        rec = hook.snapshot_file(self.base, p, self.salt, False, False)
-        self.assertEqual(rec["sha"], sha(b"content\n"))
+        rec = hook.snapshot_file(p, self.salt, False)
+        self.assertEqual(rec["sha"], self.dg(b"content\n"))
         self.assertNotIn("redacted", rec)
+        # No bytes at rest -- for ANY file, sensitive or not (issue #2).
+        self.assertFalse(self.store_contains(b"content\n"))
 
-    def test_sensitive_name_withheld(self):
+    def test_sensitive_name_flagged(self):
         p = self.wf(".env", b"API_TOKEN=zzz\n")
-        rec = hook.snapshot_file(self.base, p, self.salt, True, False)
+        rec = hook.snapshot_file(p, self.salt, True)
         self.assertTrue(rec["redacted"])
         self.assertTrue(rec["sha"].startswith("S:"))
-        # the secret bytes must NOT be in the object store
-        self.assertFalse(self._blob_contains(b"API_TOKEN=zzz"))
+        self.assertFalse(self.store_contains(b"API_TOKEN=zzz"))
 
-    def test_content_sniff_withholds_misnamed_key(self):
-        # FN3/S1: a private key saved under an innocent name is still withheld.
-        p = self.wf("notes.txt", b"-----BEGIN OPENSSH PRIVATE KEY-----\nbody999\n")
-        rec = hook.snapshot_file(self.base, p, self.salt,
-                                 hook.is_sensitive("notes.txt"), hook.is_allowlisted("notes.txt"))
-        self.assertTrue(rec["redacted"])
-        self.assertFalse(self._blob_contains(b"body999"))
-
-    def test_env_template_with_real_secret_withheld(self):
-        # L3: env/vars TEMPLATES are NOT sniff-exempt, so a real credential left in
-        # a .env.example (the copy-and-forget-to-strip pattern) is WITHHELD, not
-        # stored in cleartext. Only structurally-public names (*.pub/cert) skip it.
-        rel = ".env.example"
-        p = self.wf(rel, b"AWS_SECRET_ACCESS_KEY=AKIAEXAMPLEREALKEY01234567890ABCD\n")
-        rec = hook.snapshot_file(self.base, p, self.salt,
-                                 hook.is_sensitive(rel), hook.is_sniff_exempt(rel))
-        self.assertTrue(rec.get("redacted"))
-        self.assertFalse(self._blob_contains(b"AKIAEXAMPLEREALKEY"))
-
-    def test_clean_env_template_still_stored(self):
-        # A template with no credential-shaped content stays storable/diffable.
-        rel = ".env.example"
-        p = self.wf(rel, b"# copy to .env\nPORT=3000\nHOST=localhost\n")
-        rec = hook.snapshot_file(self.base, p, self.salt,
-                                 hook.is_sensitive(rel), hook.is_sniff_exempt(rel))
-        self.assertNotIn("redacted", rec)
-        self.assertTrue(self._blob_contains(b"PORT=3000"))
+    def test_equal_content_equal_digest(self):
+        # Digest equality across snapshots of one store is what change
+        # detection rests on: same bytes -> same digest, changed -> different.
+        p = self.wf("a.txt", b"v1\n")
+        r1 = hook.snapshot_file(p, self.salt, False)
+        r2 = hook.snapshot_file(p, self.salt, False)
+        self.assertEqual(r1["sha"], r2["sha"])
+        self.wf("a.txt", b"v2\n")
+        r3 = hook.snapshot_file(p, self.salt, False)
+        self.assertNotEqual(r1["sha"], r3["sha"])
 
     def test_toolarge_not_read(self):
-        # cas-6/C1: >10MB carries size+mtime+ctime, not a blob.
+        # cas-6/C1: >10MB carries size+mtime+ctime, never read/hashed.
         p = os.path.join(self.work, "big.bin")
         with open(p, "wb") as fh:
-            fh.truncate(hook.MAX_BLOB_BYTES + 1024)
-        rec = hook.snapshot_file(self.base, p, self.salt, False, False)
+            fh.truncate(hook.MAX_HASH_BYTES + 1024)
+        rec = hook.snapshot_file(p, self.salt, False)
         self.assertTrue(rec["toolarge"])
         self.assertIsNone(rec["sha"])
         self.assertIn("ctime", rec)
 
     def test_missing_returns_none(self):
         self.assertIsNone(hook.snapshot_file(
-            self.base, os.path.join(self.work, "nope"), self.salt, False, False))
-
-    def _blob_contains(self, needle):
-        objroot = os.path.join(self.base, "objects")
-        for dp, _, files in os.walk(objroot):
-            for f in files:
-                with open(os.path.join(dp, f), "rb") as fh:
-                    if needle in fh.read():
-                        return True
-        return False
+            os.path.join(self.work, "nope"), self.salt, False))
 
 
 class TestSnapshotTree(StoreTestCase):
@@ -388,8 +388,8 @@ class TestSnapshotTree(StoreTestCase):
             fh.write(b"2.0.0\n")
         sa = hook.snapshot_tree(self.base, a, self.salt, "x")
         sb = hook.snapshot_tree(self.base, b, self.salt, "x")
-        self.assertEqual(sa["VERSION"]["sha"], sha(b"1.0.0\n"))
-        self.assertEqual(sb["VERSION"]["sha"], sha(b"2.0.0\n"))
+        self.assertEqual(sa["VERSION"]["sha"], self.dg(b"1.0.0\n"))
+        self.assertEqual(sb["VERSION"]["sha"], self.dg(b"2.0.0\n"))
 
     def test_corrupt_manifest_rec_falls_through(self):
         # cas4-2: a rec without "sha" must NOT be reused.
@@ -404,7 +404,36 @@ class TestSnapshotTree(StoreTestCase):
         with open(mp, "w") as fh:
             json.dump(man, fh)
         snap = hook.snapshot_tree(self.base, self.work, self.salt, "s")
-        self.assertEqual(snap["v.txt"]["sha"], sha(b"real"))  # re-read, not the {}
+        self.assertEqual(snap["v.txt"]["sha"], self.dg(b"real"))  # re-read, not the {}
+
+    def test_v01_plain_hex_manifest_rec_not_reused(self):
+        # #3 T1-2: a v0.1 store's plain (unsalted) 64-hex sha shares the SAME
+        # {key, rec} manifest schema. Reusing it would copy the unsalted hash into
+        # new v0.2 events, re-introducing the offline oracle salting removed. The
+        # gate must reject any non-D:/S: digest and re-read.
+        p = self.wf("f.txt", b"hello\n")
+        st = os.lstat(p)
+        key = [st.st_mtime_ns, st.st_ctime_ns, st.st_size]
+        plain = sha(b"hello\n")                       # v0.1 unsalted format
+        mp = hook.manifest_path(self.base, "s1")
+        os.makedirs(os.path.dirname(mp), exist_ok=True)
+        with open(mp, "w") as fh:
+            json.dump({os.path.abspath(p): {"key": key,
+                                            "rec": {"sha": plain, "size": 6}}}, fh)
+        snap = hook.snapshot_tree(self.base, self.work, self.salt, "s1")
+        self.assertNotEqual(snap["f.txt"]["sha"], plain)
+        self.assertTrue(snap["f.txt"]["sha"].startswith("D:"))
+
+    def test_reusable_rec_gate(self):
+        # #3 T1-2 unit: the reuse gate accepts content-less recs (sha=None) and a
+        # matching-context D:/S: digest, rejects wrong-format and wrong-context.
+        self.assertTrue(hook._reusable_rec({"sha": None, "size": 0}, False))
+        self.assertTrue(hook._reusable_rec({"sha": "D:x"}, False))
+        self.assertTrue(hook._reusable_rec({"sha": "S:x"}, True))
+        self.assertFalse(hook._reusable_rec({"sha": "deadbeef" * 8}, False))  # v0.1 hex
+        self.assertFalse(hook._reusable_rec({"sha": "D:x"}, True))   # ctx now sensitive
+        self.assertFalse(hook._reusable_rec({"sha": "S:x"}, False))  # ctx now non-sens
+        self.assertFalse(hook._reusable_rec({"size": 0}, False))     # no "sha" key
 
 
 # ===========================================================================
@@ -490,6 +519,33 @@ class TestBuildChanges(unittest.TestCase):
         self.assertEqual(c["status"], "modified")
         self.assertEqual(c["content_unavailable"], "unreadable")
 
+    def test_ordinary_change_records_sizes(self):
+        # #3 T1-3: a non-sensitive change carries before_size/after_size (the size
+        # delta the diff renders).
+        c = hook.build_changes({"x": self.rec("1", size=10)},
+                               {"x": self.rec("2", size=25)}, True, None)[0]
+        self.assertEqual(c["before_size"], 10)
+        self.assertEqual(c["after_size"], 25)
+
+    def test_sensitive_change_omits_sizes(self):
+        # #3 T1-3: a sensitive/redacted change must NOT persist byte sizes -- the
+        # renderer hides them, so a stored size is a secret-length side channel.
+        b = {"sha": "S:aa", "size": 27, "mode": 0o600, "redacted": True}
+        a = {"sha": "S:bb", "size": 34, "mode": 0o600, "redacted": True}
+        c = hook.build_changes({".env": b}, {".env": a}, True, ".env")[0]
+        self.assertTrue(c["redacted"])
+        self.assertNotIn("before_size", c)
+        self.assertNotIn("after_size", c)
+
+    def test_mode_change_kept_when_content_also_changes(self):
+        # #3 T1-5: a single tool call that edits a file AND chmods it must keep the
+        # mode transition (it was dropped when gated on b_sha == a_sha).
+        b = {"sha": "D:aa", "size": 5, "mode": 0o644}
+        a = {"sha": "D:bb", "size": 6, "mode": 0o755}
+        c = hook.build_changes({"z": b}, {"z": a}, True, None)[0]
+        self.assertEqual(c["status"], "modified")
+        self.assertEqual(c["mode_change"], [0o644, 0o755])
+
     def test_bash_attribution(self):
         # M2/M3: concurrent tool overlap is marked, exclusive otherwise.
         before = {"o": None, "p": None}
@@ -527,7 +583,7 @@ class TestHookFlow(StoreTestCase):
         self.emit("post", "Write", tid="t1", fp="app.py")
         ev = self.events()[0]
         self.assertEqual(ev["changes"][0]["status"], "added")
-        self.assertEqual(ev["changes"][0]["after"], sha(b"print(1)\n"))
+        self.assertEqual(ev["changes"][0]["after"], self.dg(b"print(1)\n"))
 
     def test_bash_opaque_add_and_delete(self):
         # The headline: a command that names no file, reconstructed by tree diff.
@@ -565,8 +621,8 @@ class TestHookFlow(StoreTestCase):
         by_tuid = {e["tool_use_id"]: e for e in self.events()}
         self.assertEqual(by_tuid["A"]["matched_pre_id"], "A")
         self.assertEqual(by_tuid["B"]["matched_pre_id"], "B")
-        self.assertEqual(by_tuid["A"]["changes"][0]["before"], sha(b"v0\n"))
-        self.assertEqual(by_tuid["B"]["changes"][0]["before"], sha(b"v1\n"))
+        self.assertEqual(by_tuid["A"]["changes"][0]["before"], self.dg(b"v0\n"))
+        self.assertEqual(by_tuid["B"]["changes"][0]["before"], self.dg(b"v1\n"))
 
     def test_concurrent_edit_not_blamed_on_bash_reverse_order(self):
         # MC-1: a fast Edit that posts BEFORE the slow Bash post. The Bash must
@@ -596,21 +652,6 @@ class TestHookFlow(StoreTestCase):
 # alog reader / renderer
 # ===========================================================================
 
-class TestToLines(unittest.TestCase):
-    def test_binary_detected(self):
-        lines, is_bin, _ = alog.to_lines(b"a\x00b")
-        self.assertTrue(is_bin)
-
-    def test_crlf_not_extra_split(self):
-        lines, is_bin, _ = alog.to_lines(b"a\r\nb\r\n")
-        self.assertFalse(is_bin)
-        self.assertEqual(len(lines), 2)
-
-    def test_no_final_newline(self):
-        _, _, nonl = alog.to_lines(b"abc")
-        self.assertTrue(nonl)
-
-
 class TestAgentSensitive(unittest.TestCase):
     def test_bash_unchanged_secret_not_counted(self):
         ev = {"tool": "Bash"}
@@ -637,36 +678,67 @@ class TestAgentSensitive(unittest.TestCase):
 
 
 class TestRenderDiff(StoreTestCase):
-    def test_added_shows_content(self):
-        s = hook.store_blob(self.base, b"hello\n")
+    def test_added_shows_size_no_content(self):
         out = "\n".join(alog.render_one_diff(
-            self.base, {"seq": 1, "tool": "Write"},
-            {"path": "a", "status": "added", "before": None, "after": s}))
-        self.assertIn("+hello", out)
+            {"seq": 1, "tool": "Write"},
+            {"path": "a", "status": "added", "before": None, "after": "D:abc",
+             "after_size": 6}))
+        self.assertIn("created: a", out)
+        self.assertIn("(6 bytes)", out)
+        self.assertNotIn("+hello", out)   # never any content hunks
 
-    def test_binary_not_dumped(self):
-        s = hook.store_blob(self.base, b"\x00\x01bin")
+    def test_modified_shows_size_delta(self):
         out = "\n".join(alog.render_one_diff(
-            self.base, {"seq": 1, "tool": "Write"},
-            {"path": "a.bin", "status": "added", "before": None, "after": s}))
-        self.assertIn("Binary", out)
+            {"seq": 2, "tool": "Bash"},
+            {"path": "x", "status": "modified", "before": "D:a", "after": "D:b",
+             "before_size": 10, "after_size": 4}))
+        self.assertIn("modified: x", out)
+        self.assertIn("(10 -> 4 bytes, -6)", out)
+
+    def test_deleted_shows_prior_size(self):
+        out = "\n".join(alog.render_one_diff(
+            {"seq": 3, "tool": "Bash"},
+            {"path": "y", "status": "deleted", "before": "D:a", "after": None,
+             "before_size": 12}))
+        self.assertIn("deleted: y", out)
+        self.assertIn("(was 12 bytes)", out)
+
+    def test_mode_change_rendered(self):
+        out = "\n".join(alog.render_one_diff(
+            {"seq": 4, "tool": "Bash"},
+            {"path": "z", "status": "modified", "before": "D:a", "after": "D:a",
+             "before_size": 5, "after_size": 5, "mode_change": [0o644, 0o755]}))
+        self.assertIn("mode: 644 -> 755", out)
 
     def test_redacted_not_shown(self):
         out = "\n".join(alog.render_one_diff(
-            self.base, {"seq": 1, "tool": "Write"},
+            {"seq": 1, "tool": "Write"},
             {"path": ".env", "status": "added", "redacted": True, "after": "S:abc"}))
         self.assertIn("content not stored", out)
 
-    def test_missing_blob_notice(self):
-        # alog-3: a present sha that resolves to no blob -> notice, not fake diff.
+    def test_sensitive_without_redacted_flag_not_size_disclosed(self):
+        # #3 T1-4: a sensitive-by-path record with NO redacted flag and NO S:
+        # digest (e.g. an added .env symlink: sha=None) must still render as an
+        # access notice, never `created: .env (0 bytes)`.
         out = "\n".join(alog.render_one_diff(
-            self.base, {"seq": 1, "tool": "Bash"},
-            {"path": "x", "status": "modified", "before": "deadbeef" * 8, "after": None}))
-        self.assertIn("missing or pruned", out)
+            {"seq": 1, "tool": "Bash"},
+            {"path": ".env", "status": "added", "before": None, "after": None,
+             "sensitive": True, "after_size": 0}))
+        self.assertIn("content not stored", out)
+        self.assertNotIn("0 bytes", out)
+        self.assertNotIn("created:", out)
+
+    def test_tampered_sizes_do_not_crash(self):
+        # A tampered log with string sizes must degrade, not raise.
+        out = "\n".join(alog.render_one_diff(
+            {"seq": 1, "tool": "Bash"},
+            {"path": "x", "status": "modified", "before": "D:a", "after": "D:b",
+             "before_size": "huge", "after_size": None}))
+        self.assertIn("modified: x", out)
 
     def test_unreadable_notice(self):
         out = "\n".join(alog.render_one_diff(
-            self.base, {"seq": 1, "tool": "Edit"},
+            {"seq": 1, "tool": "Edit"},
             {"path": "x", "status": "modified", "before": None, "after": None,
              "content_unavailable": "unreadable"}))
         self.assertIn("unreadable at snapshot", out)
@@ -728,50 +800,36 @@ class TestRedactionR3(unittest.TestCase):
             'h Authorization: Bearer "hunter2plainpass'))
 
 
-class TestAtRestAllowlist(StoreTestCase):
+class TestNoBytesAtRest(StoreTestCase):
+    """Issue #2 invariant: NO file's bytes ever land anywhere under the store --
+    not for secrets, and not for public/allowlisted material either."""
     PK = b"-----BEGIN OPENSSH PRIVATE KEY-----\nLEAKBODY_xyz\n-----END OPENSSH PRIVATE KEY-----\n"
 
-    def _objects_contain(self, needle):
-        root = os.path.join(self.base, "objects")
-        for dp, _, files in os.walk(root):
-            for f in files:
-                with open(os.path.join(dp, f), "rb") as fh:
-                    if needle in fh.read():
-                        return True
-        return False
-
-    def test_private_key_in_allowlisted_name_withheld(self):
-        # atrest-1: a real key under an allowlisted name must NOT land at rest.
-        for name in ("backup.pub", "cert.pem", "fullchain.pem", ".env.production.example"):
+    def test_private_key_never_at_rest(self):
+        for name in ("backup.pub", "cert.pem", "id_rsa", "notes.txt"):
             p = self.wf(name, self.PK)
-            rec = hook.snapshot_file(self.base, p, self.salt,
-                                     hook.is_sensitive(name), hook.is_allowlisted(name))
-            self.assertTrue(rec.get("redacted"), name)
-        self.assertFalse(self._objects_contain(b"LEAKBODY_xyz"))
+            hook.snapshot_file(p, self.salt, hook.is_sensitive(name))
+        self.assertFalse(self.store_contains(b"LEAKBODY_xyz"))
 
-    def test_public_key_still_stored(self):
-        # The allowlist's purpose (storable public material) is preserved.
+    def test_public_key_not_at_rest_either(self):
+        # Even public material is digest-only now: there is no storage tier.
         p = self.wf("id_ed25519.pub", b"ssh-ed25519 AAAApublic comment\n")
-        rec = hook.snapshot_file(self.base, p, self.salt,
-                                 hook.is_sensitive("id_ed25519.pub"),
-                                 hook.is_allowlisted("id_ed25519.pub"))
-        self.assertNotIn("redacted", rec)
-        self.assertTrue(self._objects_contain(b"ssh-ed25519 AAAApublic"))
+        rec = hook.snapshot_file(p, self.salt, hook.is_sensitive("id_ed25519.pub"))
+        self.assertNotIn("redacted", rec)     # not flagged sensitive (allowlist)...
+        self.assertTrue(rec["sha"].startswith("D:"))  # ...but still digest-only
+        self.assertFalse(self.store_contains(b"ssh-ed25519 AAAApublic"))
 
-    def test_blob_permissions_0600(self):
-        s = hook.store_blob(self.base, b"perm-check\n")
-        mode = os.stat(os.path.join(self.base, "objects", s[:2], s)).st_mode & 0o777
-        self.assertEqual(mode & 0o077, 0, "blob must be 0600, got {0:o}".format(mode))
-
-    def test_pgp_key_in_allowlisted_name_withheld(self):
-        # atrest-pgp: a PGP private key under an allowlisted name must not leak.
-        body = (b"-----BEGIN PGP PRIVATE KEY BLOCK-----\nPGPLEAK_abc\n"
-                b"-----END PGP PRIVATE KEY BLOCK-----\n")
-        p = self.wf("cert.pem", body)
-        rec = hook.snapshot_file(self.base, p, self.salt,
-                                 hook.is_sensitive("cert.pem"), hook.is_allowlisted("cert.pem"))
-        self.assertTrue(rec.get("redacted"))
-        self.assertFalse(self._objects_contain(b"PGPLEAK_abc"))
+    def test_full_flow_leaves_no_content_in_store(self):
+        # End-to-end: a Write + a Bash tree snapshot must leave no file bytes in
+        # the store -- only digests, paths, and metadata.
+        payload = {"session_id": "s", "tool_input": {"file_path": "app.py"}}
+        hook.handle_pre(self.base, payload, "Write", self.work, self.salt, "w1")
+        self.wf("app.py", b"UNIQUE_BODY_31337\n")
+        hook.handle_post(self.base, payload, "Write", self.work, self.salt, "w1")
+        pb = {"session_id": "s", "tool_input": {"command": "true"}}
+        hook.handle_pre(self.base, pb, "Bash", self.work, self.salt, "b1")
+        hook.handle_post(self.base, pb, "Bash", self.work, self.salt, "b1")
+        self.assertFalse(self.store_contains(b"UNIQUE_BODY_31337"))
 
 
 class TestBuildChangesCtime(unittest.TestCase):
@@ -908,39 +966,6 @@ class TestReaderCLI(StoreTestCase):
         hook.handle_post(self.base, p, "Bash", self.work, self.salt, "b1")
         _, out = self.run_main(["--data", self.base, "--session", "s", "show"])
         self.assertIn("1 sensitive access(es)", out)
-
-
-class TestNoNewlineMarker(StoreTestCase):
-    def _render(self, before, after):
-        bs = hook.store_blob(self.base, before)
-        as_ = hook.store_blob(self.base, after)
-        return alog.render_one_diff(
-            self.base, {"seq": 1, "tool": "Edit"},
-            {"path": "f", "status": "modified", "before": bs, "after": as_})
-
-    def test_marker_attributed_to_after_when_only_after_lacks_nl(self):
-        # before ends with \n, after does NOT: the marker must follow the '+' line.
-        out = self._render(b"a\nb\n", b"a\nB")
-        joined = "\n".join(out)
-        self.assertIn("No newline at end of file", joined)
-        # the marker must come AFTER the added line, and there is exactly one
-        self.assertEqual(joined.count("No newline at end of file"), 1)
-        plus_idx = max(i for i, l in enumerate(out) if l.startswith("+"))
-        marker_idx = max(i for i, l in enumerate(out) if l.startswith("\\ No newline"))
-        self.assertGreater(marker_idx, plus_idx)
-
-    def test_marker_attributed_to_before_when_only_before_lacks_nl(self):
-        # before lacks the newline, after HAS it: git puts the marker after the
-        # '-' (before) line, i.e. BEFORE the last '+' line. The old end-only logic
-        # implied the after side instead -- this pins the per-side attribution.
-        out = self._render(b"a\nB", b"a\nB\n")
-        joined = "\n".join(out)
-        self.assertEqual(joined.count("No newline at end of file"), 1)
-        minus_idx = max(i for i, l in enumerate(out) if l.startswith("-"))
-        plus_idx = max(i for i, l in enumerate(out) if l.startswith("+"))
-        marker_idx = max(i for i, l in enumerate(out) if l.startswith("\\ No newline"))
-        self.assertGreater(marker_idx, minus_idx)
-        self.assertLess(marker_idx, plus_idx)   # marker precedes the added line
 
 
 class TestWalkWorktree(StoreTestCase):
@@ -1313,15 +1338,6 @@ class TestTranscriptSymlink(StoreTestCase):
 class TestTier1SecurityFixes(StoreTestCase):
     """Regressions for the pre-publish adversarial review's Tier-1 findings."""
 
-    def _blob_contains(self, needle):
-        root = os.path.join(self.base, "objects")
-        for dp, _, files in os.walk(root):
-            for f in files:
-                with open(os.path.join(dp, f), "rb") as fh:
-                    if needle in fh.read():
-                        return True
-        return False
-
     def _sessions_text(self):
         import glob
         out = ""
@@ -1352,56 +1368,16 @@ class TestTier1SecurityFixes(StoreTestCase):
         hook.URL_CRED_RE.sub("", big)
         self.assertLess(time.time() - t0, 1.0)
 
-    def test_l2_content_sniff_withholds_openai_key(self):
-        # L2: an OpenAI key in an innocently-named file was stored in cleartext
-        # (the file sniff omitted sk- shapes the command redactor already caught).
-        p = self.wf("notes.txt",
-                    b"OPENAI_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz1234567890ABCD\n")
-        rec = hook.snapshot_file(self.base, p, self.salt,
-                                 hook.is_sensitive("notes.txt"),
-                                 hook.is_sniff_exempt("notes.txt"))
-        self.assertTrue(rec.get("redacted"))
-        self.assertFalse(self._blob_contains(b"sk-proj-abcdefghij"))
-
-    def test_l2_content_sniff_withholds_jwt(self):
-        jwt = (b"token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
-               b"abcDEFghijKLMnopQRS\n")
-        p = self.wf("data.log", jwt)
-        rec = hook.snapshot_file(self.base, p, self.salt,
-                                 hook.is_sensitive("data.log"),
-                                 hook.is_sniff_exempt("data.log"))
-        self.assertTrue(rec.get("redacted"))
-
-    def test_l2_content_sniff_withholds_quoted_config_secret(self):
-        p = self.wf("config.yaml", b'db:\n  DB_PASSWORD: "hunter2secret"\n')
-        rec = hook.snapshot_file(self.base, p, self.salt,
-                                 hook.is_sensitive("config.yaml"),
-                                 hook.is_sniff_exempt("config.yaml"))
-        self.assertTrue(rec.get("redacted"))
-        self.assertFalse(self._blob_contains(b"hunter2secret"))
-
-    def test_l2_source_password_reference_still_stored(self):
-        # False-positive guard: ordinary source that merely references 'password'
-        # (unquoted, a function call) must stay stored so its diff survives.
-        p = self.wf("app.py", b"password = get_password()\nreturn password\n")
-        rec = hook.snapshot_file(self.base, p, self.salt,
-                                 hook.is_sensitive("app.py"),
-                                 hook.is_sniff_exempt("app.py"))
-        self.assertNotIn("redacted", rec)
-        self.assertTrue(self._blob_contains(b"get_password()"))
-
     def test_l4_symlink_not_followed_to_target_bytes(self):
         # L4: opening O_NOFOLLOW means a symlink (incl. one swapped in after a
         # classify stat) is rejected as non-regular, never read to its target.
         target = self.wf("secret_target", b"AKIA" + b"ABCDEFGHIJKLMNOP super secret\n")
         link = os.path.join(self.work, "innocent.txt")
         os.symlink(target, link)
-        rec = hook.snapshot_file(self.base, link, self.salt,
-                                 hook.is_sensitive("innocent.txt"),
-                                 hook.is_sniff_exempt("innocent.txt"))
+        rec = hook.snapshot_file(link, self.salt, hook.is_sensitive("innocent.txt"))
         self.assertEqual(rec.get("kind"), "non-regular")
         self.assertIsNone(rec.get("sha"))
-        self.assertFalse(self._blob_contains(b"super secret"))
+        self.assertFalse(self.store_contains(b"super secret"))
 
     def test_c1_stdin_text_decode_failure_does_not_crash(self):
         # C1: sys.stdin.read() decodes with the process locale; under a non-UTF-8
@@ -1641,8 +1617,8 @@ class TestPostFixReviewFindings(StoreTestCase):
 
     def test_f1_in_worktree_store_not_walked(self):
         # ALOG_DATA inside the worktree under a NON-'.alog' name must be pruned from
-        # the tree walk by its real path, so its 'salt' never lands in the CAS (a
-        # readable salt turns every 'S:' digest into a known-salt offline oracle).
+        # the tree walk by its real path, so the store never re-snapshots itself
+        # (quadratic growth) and the salt file is never digested with itself.
         store = os.path.join(self.work, "audit")     # not named '.alog'
         hook.ensure_dirs(store)
         salt = hook.get_salt(store)
@@ -1652,51 +1628,8 @@ class TestPostFixReviewFindings(StoreTestCase):
         self.assertIn("app.py", rels)
         self.assertFalse(any(r.startswith("audit/") or r.startswith("audit" + os.sep)
                              for r in rels), "the store dir must not be walked")
-        # end-to-end: the salt's bytes must not be stored as a CAS object
         snap = hook.snapshot_tree(store, self.work, salt, "s1")
         self.assertNotIn("audit/salt", snap)
-        salt_sha = sha(salt)
-        obj = os.path.join(store, "objects", salt_sha[:2], salt_sha)
-        self.assertFalse(os.path.exists(obj), "salt must never be a plaintext CAS blob")
-
-    # ---- Finding 2: full-content sniff (secret past the first 4 KiB) ----
-
-    def test_f2_secret_deep_in_file_is_withheld(self):
-        # A non-sensitively-NAMED file with an AWS key well past 4096 bytes must be
-        # recorded as a salted digest, not stored in cleartext.
-        content = b"# log\n" + b"x" * 5000 + b"\nAKIAIOSFODNN7EXAMPLE\n"
-        p = self.wf("app.log", content)
-        rec = hook.snapshot_file(self.base, p, self.salt, hook.is_sensitive("app.log"),
-                                 hook.is_sniff_exempt("app.log"))
-        self.assertTrue(rec.get("redacted"))
-        self.assertTrue(str(rec.get("sha")).startswith("S:"))
-        # and the cleartext key is not anywhere in the object store
-        for root, _dirs, files in os.walk(os.path.join(self.base, "objects")):
-            for f in files:
-                with open(os.path.join(root, f), "rb") as fh:
-                    self.assertNotIn(b"AKIAIOSFODNN7EXAMPLE", fh.read())
-
-    def test_f2_clean_large_file_still_stored(self):
-        # A big innocuous file must still be stored (not over-withheld).
-        p = self.wf("data.txt", b"y" * 9000)
-        rec = hook.snapshot_file(self.base, p, self.salt, False, False)
-        self.assertFalse(rec.get("redacted"))
-        self.assertFalse(str(rec.get("sha")).startswith("S:"))
-
-    # ---- Finding 3: .pub name only exempt when content is really public ----
-
-    def test_f3_pub_named_secret_is_withheld(self):
-        p = self.wf("config.pub", b"sk_live_" + b"0123456789abcdef0123456789ABCD\n")
-        rec = hook.snapshot_file(self.base, p, self.salt, hook.is_sensitive("config.pub"),
-                                 hook.is_sniff_exempt("config.pub"))
-        self.assertTrue(rec.get("redacted"), "a .pub holding a token must NOT be exempt")
-
-    def test_f3_real_pubkey_still_stored(self):
-        p = self.wf("id_ed25519.pub", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 user@host\n")
-        rec = hook.snapshot_file(self.base, p, self.salt,
-                                 hook.is_sensitive("id_ed25519.pub"),
-                                 hook.is_sniff_exempt("id_ed25519.pub"))
-        self.assertFalse(rec.get("redacted"), "a genuine public key stays storable")
 
     # ---- Finding 4: a truncated salt is healed, never returned short ----
 
@@ -1731,7 +1664,7 @@ class TestPostFixReviewFindings(StoreTestCase):
     def test_f5_records_link_target(self):
         link = os.path.join(self.work, "l")
         os.symlink("/etc/hostname", link)
-        rec = hook.snapshot_file(self.base, link, self.salt, False, False)
+        rec = hook.snapshot_file(link, self.salt, False)
         self.assertEqual(rec.get("kind"), "non-regular")
         self.assertEqual(rec.get("link_target"), "/etc/hostname")
 
@@ -1887,34 +1820,7 @@ class TestSecondReviewFindings(StoreTestCase):
     target defects introduced by the first-pass fixes; each was confirmed to FAIL on
     the d2dd10c code before the corresponding fix landed."""
 
-    # ---- R1 (CRITICAL): appended secret in a .pub is still withheld ----
-
-    def test_r1_pub_head_appended_token_withheld(self):
-        body = (b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexamplekey comment\n"
-                + b"# note\n" + b"AKIAIOSFODNN7EXAMPLE0\n")
-        p = self.wf("deploy.pub", body)
-        rec = hook.snapshot_file(self.base, p, self.salt, hook.is_sensitive("deploy.pub"),
-                                 hook.is_sniff_exempt("deploy.pub"))
-        self.assertTrue(rec.get("redacted"),
-                        "an AWS key appended after a public key head must be withheld")
-        for root, _d, files in os.walk(os.path.join(self.base, "objects")):
-            for f in files:
-                with open(os.path.join(root, f), "rb") as fh:
-                    self.assertNotIn(b"AKIAIOSFODNN7EXAMPLE0", fh.read())
-
-    def test_r1_genuine_pubkey_still_stored(self):
-        p = self.wf("ok.pub", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIcleankey user@h\n")
-        rec = hook.snapshot_file(self.base, p, self.salt, hook.is_sensitive("ok.pub"),
-                                 hook.is_sniff_exempt("ok.pub"))
-        self.assertFalse(rec.get("redacted"), "a clean public key is still storable")
-
-    # ---- R2: Google AIza key covered by sniff + redaction ----
-
-    def test_r2_google_key_withheld_at_rest(self):
-        key = b"AIza" + b"b" * 35
-        p = self.wf("notes.txt", b"google_key " + key + b"\n")
-        rec = hook.snapshot_file(self.base, p, self.salt, False, False)
-        self.assertTrue(rec.get("redacted"))
+    # ---- R2: Google AIza key covered by command redaction ----
 
     def test_r2_google_key_redacted_in_command(self):
         key = "AIza" + "b" * 35
@@ -1922,26 +1828,24 @@ class TestSecondReviewFindings(StoreTestCase):
         self.assertNotIn(key, out)
         self.assertIn("<redacted>", out)
 
-    # ---- R3 (HIGH): content-sniffed secret surfaces in the audit view ----
+    # ---- R3: a NAME-sensitive read surfaces in the audit view / --fail-on-hit ----
 
-    def test_r3_content_secret_shows_in_audit(self):
-        self.wf("notes.txt", b"token ghp_" + b"a" * 30 + b"\n")
-        pl = {"session_id": "s3", "tool_input": {"file_path": "notes.txt"}, "cwd": self.work}
+    def test_r3_sensitive_read_shows_in_audit(self):
+        self.wf(".env", b"TOKEN=ghp_" + b"a" * 30 + b"\n")
+        pl = {"session_id": "s3", "tool_input": {"file_path": ".env"}, "cwd": self.work}
         hook.handle_pre(self.base, pl, "Read", self.work, self.salt, "r1")
         hook.handle_post(self.base, pl, "Read", self.work, self.salt, "r1")
         ev = [e for e in hook.read_session_events(self.base, "s3")
               if e.get("tool_use_id") == "r1"][0]
         ch = ev["changes"][0]
         self.assertTrue(ch.get("redacted"))
-        # name is innocuous, but the `sensitive` field now ORs in `redacted` (W4) so
-        # it is consistent with the withhold decision.
         self.assertTrue(ch.get("sensitive"))
         self.assertTrue(alog.is_agent_sensitive(ev, ch), "a read secret must count")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = alog.cmd_audit(self.base, "s3", False, fail_on_hit=True)
         self.assertNotIn("(none)", buf.getvalue())
-        self.assertEqual(rc, 2, "--fail-on-hit must trip on a content-sniffed secret")
+        self.assertEqual(rc, 2, "--fail-on-hit must trip on a sensitive read")
 
     # ---- R4 (HIGH): a concurrent Bash's whole-tree 'read' must not claim a write ----
 
@@ -2054,22 +1958,16 @@ class TestThirdReviewFindings(StoreTestCase):
     completion of the R4 concurrent-Bash fix and the R8 injectivity regression; each
     was confirmed to FAIL on the pre-fix tree before its fix landed."""
 
-    # ---- F1 (MUST): URL/connection-string creds in file content withheld ----
+    # ---- F1 (MUST): connection-string creds never at rest (structural now) ----
 
-    def test_f1_url_cred_in_file_withheld(self):
+    def test_f1_url_cred_in_file_never_at_rest(self):
+        # v0.2: no content is stored for ANY file, so the old sniff-based
+        # withholding test reduces to the structural no-bytes-at-rest invariant.
         p = self.wf("database.yml",
                     b"prod:\n  url: postgres://appuser:Sup3rSecretDbPass@db.internal:5432/prod\n")
-        rec = hook.snapshot_file(self.base, p, self.salt, False, False)
-        self.assertTrue(rec.get("redacted"), "a connection-string password must not be stored")
-        for root, _d, files in os.walk(os.path.join(self.base, "objects")):
-            for f in files:
-                with open(os.path.join(root, f), "rb") as fh:
-                    self.assertNotIn(b"Sup3rSecretDbPass", fh.read())
-
-    def test_f1_plain_url_still_stored(self):
-        p = self.wf("readme.md", b"see https://example.com/docs for details\n")
-        rec = hook.snapshot_file(self.base, p, self.salt, False, False)
-        self.assertFalse(rec.get("redacted"))    # no user:pass@ -> not a credential
+        rec = hook.snapshot_file(p, self.salt, False)
+        self.assertTrue(rec["sha"].startswith("D:"))
+        self.assertFalse(self.store_contains(b"Sup3rSecretDbPass"))
 
     # ---- F2: URL_CRED_RE masks a whole @/:-bearing password ----
 
@@ -2125,11 +2023,11 @@ class TestThirdReviewFindings(StoreTestCase):
                     "seq": hook.next_seq(base, session), "session": session,
                     "tool": "Edit", "tool_use_id": "e1", "file_path": "shared.txt",
                     # sensitive Edit change whose FINAL state matches the Bash's after
-                    # (sha of "v1\n"), so the claim fires: a claim requires same-final-
-                    # state + sensitive (W3 + digest-match gates).
+                    # (salted digest of "v1\n"), so the claim fires: a claim requires
+                    # same-final-state + sensitive (W3 + digest-match gates).
                     "changes": [{"path": "shared.txt", "status": "modified",
                                  "sensitive": True, "redacted": True,
-                                 "after": sha(b"v1\n")}]})
+                                 "after": self.dg(b"v1\n")}]})
             return orig(base, tool, ti, cwd, salt, session)
 
         pl = {"session_id": "s4b", "tool_input": {"command": "sh s"}, "cwd": self.work}
@@ -2237,12 +2135,12 @@ class TestThirdReviewFindings(StoreTestCase):
             alog.cmd_show(self.base, "s10", False)
         self.assertNotIn("\x1b", buf.getvalue())
 
-    # ---- F11: is_allowlisted docstring no longer claims it skips the sniff ----
+    # ---- F11: is_allowlisted docstring matches the no-storage model ----
 
     def test_f11_is_allowlisted_docstring_corrected(self):
         doc = hook.is_allowlisted.__doc__ or ""
         self.assertNotIn("SKIP the content sniff", doc)
-        self.assertIn("is_sniff_exempt", doc)
+        self.assertIn("no content is ever stored", doc)
 
     # ---- F12: reader _num clamps negatives ----
 
@@ -2261,43 +2159,16 @@ class TestThirdReviewFindings(StoreTestCase):
 class TestScopeOneFixes(StoreTestCase):
     """Regressions for the 3-way (Workflow + Codex + AGY) fourth-review fixes."""
 
-    def _withheld(self, name, body):
-        p = self.wf(name, body)
-        rec = hook.snapshot_file(self.base, p, self.salt, hook.is_sensitive(name),
-                                 hook.is_sniff_exempt(name))
-        return bool(rec.get("redacted"))
-
-    # ---- L1: GitHub token family ----
-    def test_l1_github_token_family_withheld(self):
-        for pfx in (b"gho_", b"ghu_", b"ghs_", b"ghr_"):
-            self.assertTrue(self._withheld("notes.txt", b"tok " + pfx + b"A" * 30),
-                            "{0} must be withheld".format(pfx))
+    # ---- L1: GitHub token family redacted in commands ----
+    def test_l1_github_token_family_redacted(self):
         self.assertNotIn("ghs_" + "A" * 30,
                          hook.redact_command("gh auth ghs_" + "A" * 30))
-
-    # ---- L2: Slack app/config tokens ----
-    def test_l2_slack_app_config_tokens_withheld(self):
-        self.assertTrue(self._withheld("n.txt", b"xapp-1-" + b"A" * 20))
-        self.assertTrue(self._withheld("n.txt", b"xoxe-" + b"A" * 24))
-
-    # ---- L3: unquoted config secret withheld; placeholder / call NOT ----
-    def test_l3_unquoted_config_secret_withheld(self):
-        self.assertTrue(self._withheld("config.yaml", b"database:\n  password: swordfish\n"))
-        self.assertTrue(self._withheld("app.properties", b"api_key=supersecret123\n"))
-        self.assertTrue(self._withheld(".envrc", b"export DEPLOY_CREDENTIAL=hunter2xyz\n"))
-
-    def test_l3_call_not_withheld_template_now_withheld(self):
-        # `password = get_secret()` source is still spared (function-call guard).
-        self.assertFalse(self._withheld("app.py", b"password = get_secret()\n"))
-        # The placeholder exemption was REMOVED (it kept leaking real secrets), so a
-        # template with a KEY=value placeholder is now WITHHELD -- fail-safe.
-        self.assertTrue(self._withheld(".env.example", b"API_KEY=replace_me_example\n"))
 
     # ---- L4: symlink target redacted ----
     def test_l4_symlink_target_redacted(self):
         link = os.path.join(self.work, "l")
         os.symlink("postgres://alice:hunter2secret@db/prod", link)
-        rec = hook.snapshot_file(self.base, link, self.salt, False, False)
+        rec = hook.snapshot_file(link, self.salt, False)
         self.assertIn("<redacted>", rec.get("link_target", ""))
         self.assertNotIn("hunter2secret", rec.get("link_target", ""))
 
@@ -2332,9 +2203,9 @@ class TestScopeOneFixes(StoreTestCase):
     def test_a2_mode_change_is_modified(self):
         p = self.wf("deploy.sh", b"#!/bin/sh\necho hi\n")
         os.chmod(p, 0o644)
-        before = hook.snapshot_file(self.base, p, self.salt, False, False)
+        before = hook.snapshot_file(p, self.salt, False)
         os.chmod(p, 0o755)                       # chmod +x, content unchanged
-        after = hook.snapshot_file(self.base, p, self.salt, False, False)
+        after = hook.snapshot_file(p, self.salt, False)
         ch = hook.build_changes({"deploy.sh": before}, {"deploy.sh": after},
                                 True, None, False, [])[0]
         self.assertEqual(ch["status"], "modified")
@@ -2361,14 +2232,6 @@ class TestScopeOneFixes(StoreTestCase):
             fh.write(b'{"seq":2,"broken":"\xff\xfe bad bytes"}\n')   # invalid UTF-8
         evs = hook.read_session_events(self.base, "srb")   # must not raise
         self.assertTrue(any(e.get("message_id") == "m" for e in evs))
-
-    # ---- RS-a: read_blob rejects a traversal sha ----
-    def test_rsa_read_blob_rejects_traversal(self):
-        self.assertIsNone(alog.read_blob(self.base, "../../../../etc/hosts"))
-        self.assertIsNone(alog.read_blob(self.base, "/etc/hosts"))
-        self.assertIsNone(alog.read_blob(self.base, "not-hex"))
-        real = hook.store_blob(self.base, b"hi\n")          # a genuine 64-hex id works
-        self.assertEqual(alog.read_blob(self.base, real), b"hi\n")
 
     # ---- RS-b: corrupt seq/ts don't crash the reader ----
     def test_rsb_corrupt_seq_ts_no_crash(self):
@@ -2412,43 +2275,21 @@ class TestScopeOneFixes(StoreTestCase):
 class TestRoundSixFixes(StoreTestCase):
     """Regressions for the 3-way (Workflow+Codex+AGY) FIFTH review fixes."""
 
-    def _withheld_abs(self, ap, sensitive=None, exempt=False):
-        rec = hook.snapshot_file(self.base, ap, self.salt,
-                                 hook.is_sensitive(os.path.abspath(ap)) if sensitive is None
-                                 else sensitive, exempt)
-        return bool(rec.get("redacted"))
-
     # ---- S1: cwd-relative classifier bypass (classify by absolute path) ----
-    def test_s1_cwd_relative_ssh_config_withheld(self):
+    def test_s1_cwd_relative_ssh_config_flagged(self):
         sshdir = os.path.join(self.work, ".ssh")
         os.makedirs(sshdir)
         p = os.path.join(sshdir, "config")
         with open(p, "w") as fh:
-            fh.write("Host x\n  User me\n")          # no key shape; name 'config'
-        snap = hook.snapshot_set(self.base, [p], sshdir, self.salt)
+            fh.write("Host x\n  User me\n")          # innocuous name 'config'
+        snap = hook.snapshot_set([p], sshdir, self.salt)
         self.assertTrue(snap["config"].get("redacted"),
                         ".ssh/ segment must be seen via the absolute path")
 
-    # ---- S2: broad-sniff keyname parity ----
-    def test_s2_bare_secret_token_private_key_withheld(self):
-        for body in (b'{"secret": "aB3xK9mNpQrStUv012"}',
-                     b'{"token": "aB3xK9mNpQrStUv012"}',
-                     b"[Interface]\nPrivateKey = AQIDBAUGBwgJCgsMDQ4PEBESExQVFhc= \n",
-                     b"session_token = aB3xK9mNpQrStUv012\n"):
-            self.assertTrue(hook.content_looks_secret(body), body)
-        # command parity too
+    # ---- S2: private-key flag redaction parity in commands ----
+    def test_s2_private_key_flag_redacted(self):
         self.assertNotIn("aB3xK9mNpQrStUv012",
                          hook.redact_command("run --private-key aB3xK9mNpQrStUv012"))
-
-    # ---- S3: .pub with appended non-token secret is withheld ----
-    def test_s3_pub_appended_config_secret_withheld(self):
-        p = self.wf("deploy.pub",
-                    b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 user@h\npassword: swordfish\n")
-        self.assertTrue(self._withheld_abs(p, sensitive=False, exempt=True))
-
-    def test_s3_clean_pub_still_stored(self):
-        p = self.wf("ok.pub", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 user@h\n")
-        self.assertFalse(self._withheld_abs(p, sensitive=False, exempt=True))
 
     # ---- S4/S5: exact names + dir-segment precedence ----
     def test_s4_bare_secrets_name_sensitive(self):
@@ -2459,20 +2300,24 @@ class TestRoundSixFixes(StoreTestCase):
         self.assertTrue(hook.is_sensitive("secrets/.env.example"))
         self.assertTrue(hook.is_sensitive("/home/u/.ssh/config"))
 
-    # ---- S6: hard link withheld ----
-    def test_s6_hardlink_withheld(self):
+    # ---- S6: a hard link of a secret leaks no bytes (nothing is stored) ----
+    def test_s6_hardlink_leaks_no_bytes(self):
+        # v0.2: the hardlink withholding special-case is gone -- there is no
+        # storage tier for an alias to leak into. The digest is salted, so the
+        # alias's record confirms nothing about the secret's content either.
         env = self.wf(".env", b"correct horse battery staple\n")
         alias = os.path.join(self.work, "notes.txt")
         os.link(env, alias)                          # hard link, non-sensitive name
-        rec = hook.snapshot_file(self.base, alias, self.salt, False, False)
-        self.assertTrue(rec.get("redacted"), "a multi-linked file must be withheld")
+        rec = hook.snapshot_file(alias, self.salt, False)
+        self.assertTrue(rec["sha"].startswith("D:"))
+        self.assertFalse(self.store_contains(b"correct horse battery staple"))
 
     # ---- S7: symlink alias to a secret is flagged ----
     def test_s7_symlink_alias_read_flagged(self):
         self.wf(".env", b"SECRET=v\n")
         alias = os.path.join(self.work, "alias.txt")
         os.symlink(".env", alias)
-        rec = hook.snapshot_file(self.base, alias, self.salt, False, False)
+        rec = hook.snapshot_file(alias, self.salt, False)
         self.assertTrue(rec.get("target_sensitive"))
         # command-path scan flags the alias (which resolves to a secret target)
         self.assertIn("alias.txt", hook.scan_cmd_for_secrets("cat alias.txt", self.work))
@@ -2599,21 +2444,6 @@ class TestRoundSixReviewFixes(StoreTestCase):
     """Regressions for the SIXTH (3-way) review, incl. a critical regression the
     round-6 placeholder carve-out introduced."""
 
-    # ---- W1 + Workflow-7 + AGY-4: placeholder exemption removed -> no leak class ----
-    def test_w1_no_placeholder_bypass(self):
-        # secrets that CONTAIN or START WITH a placeholder word are withheld (the three
-        # ways the removed exemption leaked across rounds 6-7)
-        self.assertTrue(hook.content_looks_secret(b"DB_PASSWORD=Pr0dPassxxxxK9zQ"))
-        self.assertTrue(hook.content_looks_secret(b"db_password=yourPr0dS3cretK9mQ7pL2wZ5"))
-        self.assertTrue(hook.content_looks_secret(b"api_key=abcyourdef1234567890"))
-        # a template placeholder is now withheld too (fail-safe cost of no exemption)
-        self.assertTrue(hook.content_looks_secret(b"API_KEY=replace_me_example"))
-
-    # ---- Codex-2: short high-confidence secret values withheld ----
-    def test_codex2_short_password_withheld(self):
-        self.assertTrue(hook.content_looks_secret(b"password: abcde"))
-        self.assertFalse(hook.content_looks_secret(b"password = get_secret()"))  # source spared
-
     # ---- Codex-4 (verified): PostToolUseFailure is captured ----
     def test_codex4_posttooluse_failure_records_event(self):
         import sys
@@ -2663,29 +2493,29 @@ class TestRoundSixReviewFixes(StoreTestCase):
         with contextlib.redirect_stdout(buf):
             self.assertEqual(alog.cmd_diff(self.base, "c8", None), 0)   # no AttributeError
 
-    # ---- W3: a benign concurrent Write must not suppress a Bash secret write ----
-    def test_w3_benign_write_does_not_hide_bash_secret(self):
-        self.wf("notes.txt", b"hello\n")
+    # ---- W3: a different-state concurrent Write must not suppress a Bash secret write ----
+    def test_w3_different_state_write_does_not_hide_bash_secret(self):
+        self.wf(".env", b"TOKEN=old\n")
 
         def bpl():
             return {"session_id": "w3", "cwd": self.work,
                     "tool_input": {"command": "sh s"}}
         wpl = {"session_id": "w3", "cwd": self.work,
-               "tool_input": {"file_path": "notes.txt"}}
+               "tool_input": {"file_path": ".env"}}
         hook.handle_pre(self.base, bpl(), "Bash", self.work, self.salt, "B")
         hook.handle_pre(self.base, wpl, "Edit", self.work, self.salt, "E")
-        with open(os.path.join(self.work, "notes.txt"), "w") as fh:
-            fh.write("just some notes\n")             # Edit writes BENIGN bytes
+        with open(os.path.join(self.work, ".env"), "w") as fh:
+            fh.write("TOKEN=edit-state\n")            # Edit writes ONE state
         hook.handle_post(self.base, wpl, "Edit", self.work, self.salt, "E")
-        with open(os.path.join(self.work, "notes.txt"), "w") as fh:
-            fh.write("export TOKEN=ghp_" + "a" * 30 + "\n")   # Bash writes a SECRET
+        with open(os.path.join(self.work, ".env"), "w") as fh:
+            fh.write("TOKEN=ghp_" + "a" * 30 + "\n")  # Bash writes a DIFFERENT secret state
         hook.handle_post(self.base, bpl(), "Bash", self.work, self.salt, "B")
         bev = [e for e in hook.read_session_events(self.base, "w3")
                if e.get("tool_use_id") == "B"][0]
-        nc = {c["path"]: c for c in bev["changes"]}.get("notes.txt")
+        nc = {c["path"]: c for c in bev["changes"]}.get(".env")
         self.assertTrue(nc.get("redacted"))
         self.assertNotEqual(nc.get("attribution"), "claimed_by_concurrent",
-                            "a benign Edit must not claim the Bash's secret write")
+                            "an Edit whose final state differs must not claim the Bash write")
         self.assertTrue(alog.is_agent_sensitive(bev, nc),
                         "the secret write must surface (no false all-clear)")
 
@@ -2693,10 +2523,6 @@ class TestRoundSixReviewFixes(StoreTestCase):
 class TestSeventhReviewFixes(StoreTestCase):
     """Regressions for the SEVENTH review (AGY) -- three of these were regressions in
     the round-6 fixes themselves (S1 abspath, W1 placeholder $, B1 TOCTOU)."""
-
-    # ---- AGY-4: a real secret on a non-last line is withheld (was a $ / EOF bug) ----
-    def test_agy4_multiline_secret_withheld(self):
-        self.assertTrue(hook.content_looks_secret(b"API_KEY=Pr0dRealSecretK9zQ\nOTHER=1\n"))
 
     # ---- AGY-3 (self-introduced): ancestor 'secrets/' must not over-withhold ----
     def test_agy3_ancestor_generic_dir_not_over_withheld(self):
@@ -2713,13 +2539,9 @@ class TestSeventhReviewFixes(StoreTestCase):
         p = os.path.join(deep, "app.py")
         with open(p, "w") as fh:
             fh.write("print('hi')\n")
-        snap = hook.snapshot_set(self.base, [p], deep, self.salt)
+        snap = hook.snapshot_set([p], deep, self.salt)
         self.assertFalse(snap["app.py"].get("redacted"),
-                         "an ordinary file under an ancestor secrets/ must stay stored")
-
-    # ---- AGY-2: byte URL regex catches an @-in-password credential ----
-    def test_agy2_url_at_password_withheld(self):
-        self.assertTrue(hook.content_looks_secret(b"db: postgres://u:pa@ss@host/prod"))
+                         "an ordinary file under an ancestor secrets/ is not sensitive")
 
     # ---- AGY-1 (self-introduced TOCTOU): a FIFO transcript never blocks ----
     def test_agy1_fifo_transcript_nonblocking(self):
@@ -2738,39 +2560,38 @@ class TestSeventhReviewCodexFixes(StoreTestCase):
         secrets = os.path.join(self.work, "secrets")
         os.makedirs(secrets)
         with open(os.path.join(secrets, "opaque.txt"), "w") as fh:
-            fh.write("swordfish\n")                # no content-sniff shape
+            fh.write("swordfish\n")                # innocuous-looking content
         os.symlink(secrets, os.path.join(self.work, "alias"))
         p = os.path.join(self.work, "alias", "opaque.txt")   # reached via symlinked parent
-        snap = hook.snapshot_set(self.base, [p], self.work, self.salt)
+        snap = hook.snapshot_set([p], self.work, self.salt)
         rec = snap[hook.rel_to_cwd(self.work, p)]
         self.assertTrue(rec.get("redacted"),
-                        "a file under a symlinked-to-secrets/ parent must be withheld")
+                        "a file under a symlinked-to-secrets/ parent must be flagged")
 
     # ---- Codex-5: a concurrent Write with a DIFFERENT final state must not claim ----
     def test_codex5_different_final_state_not_claimed(self):
-        self.wf("notes.txt", b"base\n")
+        self.wf("creds/secrets.env", b"base\n")
 
         def bpl():
             return {"session_id": "c5", "cwd": self.work, "tool_input": {"command": "sh s"}}
-        wpl = {"session_id": "c5", "cwd": self.work, "tool_input": {"file_path": "notes.txt"}}
+        wpl = {"session_id": "c5", "cwd": self.work,
+               "tool_input": {"file_path": "creds/secrets.env"}}
         hook.handle_pre(self.base, bpl(), "Bash", self.work, self.salt, "B")
         hook.handle_pre(self.base, wpl, "Edit", self.work, self.salt, "E")
-        with open(os.path.join(self.work, "notes.txt"), "w") as fh:
+        with open(os.path.join(self.work, "creds/secrets.env"), "w") as fh:
             fh.write("password: firstsecret\n")    # Edit's final state
         hook.handle_post(self.base, wpl, "Edit", self.work, self.salt, "E")
-        with open(os.path.join(self.work, "notes.txt"), "w") as fh:
+        with open(os.path.join(self.work, "creds/secrets.env"), "w") as fh:
             fh.write("password: secondsecret\n")   # Bash's DIFFERENT final state
         hook.handle_post(self.base, bpl(), "Bash", self.work, self.salt, "B")
         bev = [e for e in hook.read_session_events(self.base, "c5")
                if e.get("tool_use_id") == "B"][0]
-        nc = {c["path"]: c for c in bev["changes"]}.get("notes.txt")
+        nc = {c["path"]: c for c in bev["changes"]}.get("creds/secrets.env")
         self.assertNotEqual(nc.get("attribution"), "claimed_by_concurrent")
         self.assertTrue(alog.is_agent_sensitive(bev, nc))
 
-    # ---- Codex-1: GitLab/Vault tokens + .vault-token/.envrc ----
+    # ---- Codex-1: .vault-token/.envrc classified sensitive ----
     def test_codex1_more_tokens_and_names(self):
-        self.assertTrue(hook.content_looks_secret(b"tok glpat-" + b"abcdefghij0123456789 x"))
-        self.assertTrue(hook.content_looks_secret(b"VAULT hvs." + b"CAESIabcdefghij012345 x"))
         self.assertTrue(hook.is_sensitive(".vault-token"))
         self.assertTrue(hook.is_sensitive(".envrc"))
 
@@ -2866,37 +2687,8 @@ class TestSeventhReviewMediums(StoreTestCase):
 
 
 class TestFinalClaudeReviewFixes(unittest.TestCase):
-    """Round-8 (Claude-only) review: two robustness/DoS asymmetries where a
+    """Round-8 (Claude-only) review: robustness/DoS asymmetries where a
     defense applied in one place was missing from its mirror site."""
-
-    # ---- ReDoS: the content-sniff broad KV patterns must not backtrack ----
-    # quadratically on a crafted keyword run (KV_SECRET_RE was bounded {0,40}
-    # for exactly this reason; the content mirrors at hook.py L313/L320 were not).
-    # Run in a SEPARATE PROCESS: re.search holds the GIL for the whole O(n^2)
-    # scan, so a thread would freeze the whole interpreter (which is the bug).
-    def test_content_sniff_no_redos_on_keyword_run(self):
-        import multiprocessing
-        try:
-            ctx = multiprocessing.get_context("fork")
-        except ValueError:
-            self.skipTest("no fork start method on this platform")
-        # ~256 KiB of the keyword 'auth' with no ':'/'=' -- pre-fix this is
-        # O(n^2) (minutes); post-fix the bounded run makes it instant.
-        p = ctx.Process(target=_redos_probe, args=(b"auth" * 65536,))
-        p.start()
-        p.join(4.0)
-        alive = p.is_alive()
-        if alive:
-            p.terminate()
-            p.join(2.0)
-        self.assertFalse(alive,
-                         "content_looks_secret hung on a keyword run (ReDoS)")
-
-    def test_content_sniff_still_detects_unquoted_secret(self):
-        # Behaviour preserved: the bound must not stop real secrets matching.
-        self.assertTrue(hook.content_looks_secret(b"API_KEY=supersecret\n"))
-        self.assertTrue(hook.content_looks_secret(b"password: swordfish\n"))
-        self.assertTrue(hook.content_looks_secret(b'DB_PASSWORD: "hunter2"\n'))
 
     # ---- a FIFO swapped in for a fixed-path store READ must not block the ----
     # hook forever. get_salt() runs on every event BEFORE the session lock, so
