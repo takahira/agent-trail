@@ -432,8 +432,14 @@ def _change_line(ev: Dict, c: Dict, tool: str) -> Optional[str]:
     tc = "  (type change)" if status == "typechange" else ""
     lc = ""
     if status != "typechange" and c.get("large"):
-        lc = "  (large; {0}->{1} bytes, content not hashed)".format(
-            _safe_inline(str(c.get("before_size"))), _safe_inline(str(c.get("after_size"))))
+        # A sensitive large file records no sizes (they'd leak the secret's byte
+        # length), so print a size-free notice rather than 'None->None bytes'.
+        b_sz, a_sz = _size_int(c.get("before_size")), _size_int(c.get("after_size"))
+        if b_sz is None and a_sz is None:
+            lc = "  (large; content not hashed)"
+        else:
+            lc = "  (large; {0}->{1} bytes, content not hashed)".format(
+                _safe_inline(str(c.get("before_size"))), _safe_inline(str(c.get("after_size"))))
     elif status != "typechange" and c.get("content_unavailable") == "unreadable":
         lc = "  (unreadable at snapshot; content not captured)"
     mc = ""

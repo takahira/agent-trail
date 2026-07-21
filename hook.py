@@ -816,11 +816,13 @@ def snapshot_file(abs_path: str, salt: bytes, sensitive: bool) -> Optional[Dict]
         try:
             st = os.lstat(abs_path)
         except OSError:
-            return {"sha": None, "size": 0, "unreadable": True}
+            return {"sha": None, "size": 0, "unreadable": True,
+                    "redacted": bool(sensitive)}
         if not stat.S_ISREG(st.st_mode):
             return _nonregular_rec(abs_path)
         return {"sha": None, "size": st.st_size, "unreadable": True,
-                "mtime": st.st_mtime_ns, "ctime": st.st_ctime_ns}
+                "mtime": st.st_mtime_ns, "ctime": st.st_ctime_ns,
+                "redacted": bool(sensitive)}
     try:
         with os.fdopen(fd, "rb") as fh:
             st = os.fstat(fh.fileno())
@@ -838,9 +840,11 @@ def snapshot_file(abs_path: str, salt: bytes, sensitive: bool) -> Optional[Dict]
         try:
             est = os.lstat(abs_path)
             return {"sha": None, "size": est.st_size, "unreadable": True,
-                    "mtime": est.st_mtime_ns, "ctime": est.st_ctime_ns}
+                    "mtime": est.st_mtime_ns, "ctime": est.st_ctime_ns,
+                    "redacted": bool(sensitive)}
         except OSError:
-            return {"sha": None, "size": 0, "unreadable": True}
+            return {"sha": None, "size": 0, "unreadable": True,
+                    "redacted": bool(sensitive)}
     if len(content) > MAX_HASH_BYTES:
         return _toolarge_rec(st, sensitive)
     mode = stat.S_IMODE(st.st_mode)          # permission bits, for chmod detection
@@ -1533,11 +1537,13 @@ def build_changes(before: Dict[str, Optional[Dict]],
                 and _meta(b, "mode") != _meta(a, "mode")):
             rec["mode_change"] = [_meta(b, "mode"), _meta(a, "mode")]
         # Sizes are part of the change-detection story `alog diff` renders -- but
-        # NOT for a sensitive/redacted file: the renderer suppresses everything
-        # beyond status there, so a recorded size would be stored-but-never-shown
-        # data that leaks a secret's byte length (a side channel on key type /
-        # token shape). Withhold it, mirroring what the renderer already hides.
-        if not redacted:
+        # NOT for a sensitive file: the renderer suppresses everything beyond
+        # status there, so a recorded size would be stored-but-never-shown data
+        # that leaks a secret's byte length (a side channel on key type / token
+        # shape). Gate on the FINAL `sensitive` flag, not `redacted`: an unreadable
+        # or too-large sensitive file (whose content-less record carries no
+        # `redacted`) is still sensitive by name/path and must not leak its size.
+        if not rec["sensitive"]:
             rec["before_size"] = _meta(b, "size")
             rec["after_size"] = _meta(a, "size")
         if unavailable:

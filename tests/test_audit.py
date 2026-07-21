@@ -537,6 +537,19 @@ class TestBuildChanges(unittest.TestCase):
         self.assertNotIn("before_size", c)
         self.assertNotIn("after_size", c)
 
+    def test_unavailable_sensitive_change_omits_sizes(self):
+        # #3 re-review sensitivity-1: an unreadable/too-large SENSITIVE file has no
+        # `redacted` flag on its content-less record, but is sensitive by name --
+        # its size must still be withheld (gate on the final `sensitive`, not
+        # `redacted`), else a secret's byte length leaks for exactly these cases.
+        for rec in ({"sha": None, "size": 27, "unreadable": True, "mtime": 1, "ctime": 1},
+                    {"sha": None, "size": 11_000_000, "toolarge": True, "mtime": 1,
+                     "ctime": 1}):
+            c = hook.build_changes({".env": None}, {".env": rec}, True, ".env")[0]
+            self.assertTrue(c["sensitive"])
+            self.assertNotIn("before_size", c)
+            self.assertNotIn("after_size", c)
+
     def test_mode_change_kept_when_content_also_changes(self):
         # #3 T1-5: a single tool call that edits a file AND chmods it must keep the
         # mode transition (it was dropped when gated on b_sha == a_sha).
@@ -742,6 +755,29 @@ class TestRenderDiff(StoreTestCase):
             {"path": "x", "status": "modified", "before": None, "after": None,
              "content_unavailable": "unreadable"}))
         self.assertIn("unreadable at snapshot", out)
+
+    def test_show_large_sensitive_no_none_bytes(self):
+        # #3 re-review renderer-1: a sensitive large-file change records no sizes,
+        # so `alog show`'s _change_line must print a size-free notice, never the
+        # literal 'None->None bytes'.
+        line = alog._change_line(
+            {"tool": "Edit"},
+            {"path": ".env", "status": "modified", "sensitive": True,
+             "redacted": True, "large": True, "content_unavailable": "large",
+             "before": "S:a", "after": "S:b"}, "edit")
+        self.assertIn("large; content not hashed", line)
+        self.assertNotIn("None", line)
+
+    def test_show_large_nonsensitive_keeps_sizes(self):
+        # A non-sensitive large file still shows its size delta.
+        line = alog._change_line(
+            {"tool": "Edit"},
+            {"path": "big.bin", "status": "modified", "large": True,
+             "content_unavailable": "large", "before_size": 11_000_000,
+             "after_size": 12_000_000, "before": "D:a", "after": "D:b"}, "edit")
+        self.assertIn("11000000", line)
+        self.assertIn("12000000", line)
+        self.assertIn("bytes", line)
 
 
 class TestArgparseSessionFilter(StoreTestCase):
