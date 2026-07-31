@@ -99,6 +99,17 @@ Environment:
 
 - `ALOG_DATA` — store location (default: `<cwd>/.alog`)
 - `ALOG_DEBUG=1` — print the hook's internal log to stderr
+- `ALOG_MAX_TREE_FILES` — file-count ceiling for one whole-tree `Bash` snapshot
+  (default `20000`; `0` disables)
+- `ALOG_MAX_TREE_SECONDS` — elapsed-time budget for one whole-tree `Bash`
+  snapshot (default `3`; `0` disables)
+
+> **Wiring globally? Mind large trees.** The whole-tree `Bash` snapshot re-walks
+> the tree on every `Bash` call, and each *new* session's first call is a cold
+> full read + hash. In a very large directory the snapshot hits the ceilings
+> above and is **skipped** — recorded as a `tree_snapshot_skipped` event, so the
+> gap is visible but that command's tree changes are not captured. Prefer
+> per-project wiring for big workspaces (see Limitations).
 
 ## Usage
 
@@ -262,6 +273,25 @@ Honest scope — this records a lot, but not everything:
   produces no file-change record (the *command string* is still captured and
   secret-scanned). A `Write`/`Edit` to the same path **is** recorded, since
   single-file tools snapshot the named path directly.
+- **Very large work trees degrade to a recorded gap.** `Bash` snapshots the
+  whole tree, and the reuse manifest is **per-session**, so every *new* session's
+  first `Bash` command pays a cold full-tree read + hash. The snapshot is
+  ceiling-bounded: more than `ALOG_MAX_TREE_FILES` files (default 20,000) or
+  `ALOG_MAX_TREE_SECONDS` elapsed (default 3) skips the tree snapshot for that
+  event and writes a `tree_snapshot_skipped` event instead — the command string
+  is still captured and secret-scanned, but tree changes made by that command are
+  **not** captured (the gap is recorded, never a silent all-clear; a warning is
+  also printed to stderr under `ALOG_DEBUG=1`). Set either variable to `0` to
+  disable that ceiling. **Wiring the hook globally (`~/.claude/settings.json`)
+  means it runs wherever you start Claude Code — in a very large directory
+  (a home directory, a monorepo root) expect skipped tree snapshots or, with the
+  ceilings disabled, slow `Bash` calls.** Prefer per-project wiring, or point
+  `ALOG_DATA` at a scoped store and start sessions in the project root.
+- **A session-lock timeout drops the event, and the drop is recorded.** If the
+  per-session lock cannot be acquired within 10s (a wedged holder), the hook
+  fails open and that one event is lost; the next successful write appends an
+  `events_dropped` marker with the count, so the gap is visible in the log
+  (best-effort: the counter itself is written without a lock).
 - **Retention / GC is not implemented.** Command strings, prompts, and turn
   events accumulate without bound (the pending stack alone is TTL- and
   length-capped). With no content storage the growth is text-sized, not

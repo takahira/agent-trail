@@ -2895,5 +2895,251 @@ class TestFinalGateReviewFixes(StoreTestCase):
         self.assertIn("prod.env", buf.getvalue())   # and the CMD-REF still prints
 
 
+# ===========================================================================
+# Issue #5 / #7: tree-walk ceilings, realpath memoization, lock-drop marker
+# ===========================================================================
+
+class CeilingTestCase(StoreTestCase):
+    """StoreTestCase plus save/restore of the ALOG_MAX_TREE_* env vars."""
+
+    def setUp(self):
+        super().setUp()
+        self._prev_env = {k: os.environ.get(k)
+                          for k in ("ALOG_MAX_TREE_FILES", "ALOG_MAX_TREE_SECONDS")}
+
+    def tearDown(self):
+        for k, v in self._prev_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+
+class TestWalkCeiling(CeilingTestCase):
+    def test_walk_stops_at_file_count_ceiling(self):
+        # #5: the walk must STOP as soon as the ceiling is exceeded -- not
+        # enumerate the whole tree and complain afterwards.
+        for i in range(100):
+            self.wf("d{0}/f{1}.txt".format(i % 5, i), b"x")
+        with self.assertRaises(hook.TreeCeilingExceeded) as ctx:
+            hook.walk_worktree(self.work, self.base, max_files=5)
+        self.assertEqual(ctx.exception.reason, "file_count")
+        self.assertLessEqual(ctx.exception.files_seen, 10)   # early stop, not 100
+
+    def test_snapshot_skipped_emits_gap_event_and_empty_changes(self):
+        # #5 end-to-end: over-ceiling tree -> Pre and Post each record a
+        # tree_snapshot_skipped event, and the tool event carries NO fabricated
+        # changes (before unknown + after unknown must not invent added/deleted).
+        for i in range(12):
+            self.wf("f{0}.txt".format(i), b"x")
+        os.environ["ALOG_MAX_TREE_FILES"] = "10"
+        payload = {"session_id": "ceil", "cwd": self.work,
+                   "tool_input": {"command": "true"}}
+        hook.handle_pre(self.base, payload, "Bash", self.work, self.salt, "t1")
+        hook.handle_post(self.base, payload, "Bash", self.work, self.salt, "t1")
+        evs = hook.read_session_events(self.base, "ceil")
+        skips = [e for e in evs if e.get("kind") == "tree_snapshot_skipped"]
+        self.assertEqual([e.get("phase") for e in skips], ["pre", "post"])
+        for e in skips:
+            self.assertEqual(e.get("reason"), "file_count")
+            self.assertEqual(e.get("max_files"), 10)
+            self.assertGreater(e.get("files_seen"), 10)
+        tool_evs = [e for e in evs if not e.get("kind")]
+        self.assertEqual(len(tool_evs), 1)
+        ev = tool_evs[0]
+        self.assertEqual(ev["changes"], [])
+        self.assertEqual(ev.get("snapshot_skipped"), "file_count")
+        self.assertTrue(ev.get("before_snapshot_skipped"))
+        self.assertFalse(ev.get("had_before"))
+        self.assertEqual(ev.get("command"), "true")   # command still captured
+        # No manifest was persisted for the skipped snapshots: an aborted walk
+        # must never evict/replace the (here: nonexistent) warm cache.
+        self.assertEqual(hook.load_manifest(self.base, "ceil"), {})
+        # The reader renders the gap as a gap (no crash, no tool-line fallback).
+        line = alog.render_nontool(skips[0], False, False)
+        self.assertIn("skipped", line)
+
+    def test_time_budget_ceiling(self):
+        # #5: an exceeded elapsed-time budget raises with reason=time_budget.
+        for i in range(3):
+            self.wf("t{0}.txt".format(i), b"x")
+        os.environ["ALOG_MAX_TREE_SECONDS"] = "0.000000001"
+        with self.assertRaises(hook.TreeCeilingExceeded) as ctx:
+            hook.snapshot_tree(self.base, self.work, self.salt, "s-time")
+        self.assertEqual(ctx.exception.reason, "time_budget")
+
+    def test_zero_disables_ceilings(self):
+        for i in range(12):
+            self.wf("z{0}.txt".format(i), b"x")
+        os.environ["ALOG_MAX_TREE_FILES"] = "0"
+        os.environ["ALOG_MAX_TREE_SECONDS"] = "0"
+        snap = hook.snapshot_tree(self.base, self.work, self.salt, "s-off")
+        self.assertEqual(len(snap), 12)
+
+    def test_env_defaults_and_garbage(self):
+        os.environ.pop("ALOG_MAX_TREE_FILES", None)
+        os.environ.pop("ALOG_MAX_TREE_SECONDS", None)
+        self.assertEqual(hook.tree_max_files(), hook.DEFAULT_MAX_TREE_FILES)
+        self.assertEqual(hook.tree_max_seconds(), hook.DEFAULT_MAX_TREE_SECONDS)
+        os.environ["ALOG_MAX_TREE_FILES"] = "banana"
+        os.environ["ALOG_MAX_TREE_SECONDS"] = "nan"
+        self.assertEqual(hook.tree_max_files(), hook.DEFAULT_MAX_TREE_FILES)
+        self.assertEqual(hook.tree_max_seconds(), hook.DEFAULT_MAX_TREE_SECONDS)
+
+    def test_under_ceiling_tree_still_fully_recorded(self):
+        # Guard against over-eager skipping: a small tree under the ceilings
+        # must snapshot exactly as before.
+        os.environ["ALOG_MAX_TREE_FILES"] = "100"
+        self.wf("ok.txt", b"x")
+        payload = {"session_id": "small", "cwd": self.work,
+                   "tool_input": {"command": "true"}}
+        hook.handle_pre(self.base, payload, "Bash", self.work, self.salt, "t1")
+        hook.handle_post(self.base, payload, "Bash", self.work, self.salt, "t1")
+        evs = hook.read_session_events(self.base, "small")
+        self.assertFalse([e for e in evs if e.get("kind") == "tree_snapshot_skipped"])
+        ev = evs[-1]
+        self.assertTrue(ev.get("had_before"))
+        self.assertEqual([c["path"] for c in ev["changes"]], ["ok.txt"])
+
+    def test_skip_path_holds_hook_contract_via_cli(self):
+        # The CLI entry must exit 0 with a clean stdout on the skip path too.
+        import subprocess
+        import sys as _sys
+        for i in range(12):
+            self.wf("c{0}.txt".format(i), b"x")
+        env = dict(os.environ)
+        env["ALOG_MAX_TREE_FILES"] = "10"
+        env["ALOG_DATA"] = self.base
+        env.pop("ALOG_DEBUG", None)
+        for ev_name in ("PreToolUse", "PostToolUse"):
+            payload = {"hook_event_name": ev_name, "session_id": "cli",
+                       "tool_name": "Bash", "tool_use_id": "t1",
+                       "cwd": self.work, "tool_input": {"command": "true"}}
+            p = subprocess.run([_sys.executable, os.path.join(HERE, "hook.py")],
+                               input=json.dumps(payload), capture_output=True,
+                               text=True, env=env)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stdout, "")          # no stdout pollution
+            self.assertEqual(p.stderr, "")          # silent without ALOG_DEBUG
+        skips = [e for e in hook.read_session_events(self.base, "cli")
+                 if e.get("kind") == "tree_snapshot_skipped"]
+        self.assertEqual(len(skips), 2)
+
+
+class TestLockDropMarker(StoreTestCase):
+    def test_drop_is_recorded_and_marker_appended_on_next_write(self):
+        # #7 MEDIUM: a session-lock timeout drops the event; the NEXT successful
+        # write must append an events_dropped marker so the gap is visible.
+        import fcntl as _fcntl
+        sess = "locked"
+        lock_path = os.path.join(self.base, "locks",
+                                 hook._safe_session(sess) + ".lock")
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        holder = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        prev_timeout = hook.LOCK_ACQUIRE_TIMEOUT
+        hook.LOCK_ACQUIRE_TIMEOUT = 0.05
+        try:
+            _fcntl.flock(holder, _fcntl.LOCK_EX)
+            with self.assertRaises(TimeoutError):   # main() would swallow this
+                hook.handle_user_prompt(self.base, {"session_id": sess,
+                                                    "prompt": "lost prompt"})
+            self.assertEqual(hook.read_session_events(self.base, sess), [])
+            _fcntl.flock(holder, _fcntl.LOCK_UN)
+            hook.handle_user_prompt(self.base, {"session_id": sess,
+                                                "prompt": "second prompt"})
+        finally:
+            hook.LOCK_ACQUIRE_TIMEOUT = prev_timeout
+            os.close(holder)
+        evs = hook.read_session_events(self.base, sess)
+        self.assertEqual([e.get("kind") for e in evs],
+                         ["events_dropped", "prompt"])
+        self.assertEqual(evs[0]["count"], 1)
+        self.assertEqual(evs[0]["reason"], "session_lock_timeout")
+        self.assertEqual(evs[0]["seq"], 1)
+        self.assertEqual(evs[1]["seq"], 2)
+        # The counter was reset: a third write adds no second marker.
+        hook.handle_user_prompt(self.base, {"session_id": sess, "prompt": "third"})
+        evs = hook.read_session_events(self.base, sess)
+        self.assertEqual([e.get("kind") for e in evs],
+                         ["events_dropped", "prompt", "prompt"])
+        # The reader renders the marker as a gap line.
+        self.assertIn("dropped", alog.render_nontool(evs[0], False, False))
+
+
+class TestRealpathMemo(StoreTestCase):
+    def test_memoized_verdicts_equal_uncached(self):
+        # #7 HIGH: the per-parent realpath memo must return the SAME sensitivity
+        # verdict as the uncached per-file realpath, across every case class:
+        # plain files, sensitive segments, symlinked sensitive parents, and a
+        # symlink file whose target is sensitive.
+        self.wf("plain.txt", b"a")
+        self.wf("sub/deep/nested.py", b"b")
+        self.wf("secrets/inner.txt", b"c")
+        self.wf(".env", b"d")
+        real_ssh = os.path.join(self.tmp, "realhome", ".ssh")
+        os.makedirs(real_ssh)
+        with open(os.path.join(real_ssh, "config"), "w") as fh:
+            fh.write("Host x\n")
+        os.makedirs(os.path.join(self.work, "sub2"))
+        os.symlink(real_ssh, os.path.join(self.work, "sub2", "alias"))
+        os.symlink(os.path.join(self.work, "secrets", "inner.txt"),
+                   os.path.join(self.work, "linkfile"))
+        paths = [
+            os.path.join(self.work, "plain.txt"),
+            os.path.join(self.work, "sub", "deep", "nested.py"),
+            os.path.join(self.work, "secrets", "inner.txt"),
+            os.path.join(self.work, ".env"),
+            os.path.join(self.work, "sub2", "alias", "config"),  # symlinked parent
+            os.path.join(self.work, "linkfile"),                 # symlink file
+        ]
+        rcwd = os.path.realpath(self.work)
+        cache = {}
+        verdicts = []
+        for ap in paths:
+            disp = hook.rel_to_cwd(self.work, ap)
+            expected = hook.path_is_sensitive(ap, disp, self.work)  # uncached
+            actual = hook.path_is_sensitive(ap, disp, self.work, rcwd, cache)
+            self.assertEqual(actual, expected, ap)
+            verdicts.append(expected)
+        # Sanity: the fixture really exercises both verdicts, and the alias /
+        # linkfile cases are only catchable through realpath resolution.
+        self.assertEqual(verdicts, [False, False, True, True, True, True])
+        self.assertTrue(cache)                     # the memo was actually used
+
+    def test_snapshot_tree_flags_symlinked_parent_secret(self):
+        # End-to-end guard: snapshot_tree (which passes the memo) still flags a
+        # file whose PARENT is a symlink into a sensitive dir. walk_worktree
+        # never descends symlinked dirs, so exercise the classification via a
+        # relative-path secrets segment reached through the resolved form.
+        self.wf("secrets/token.txt", b"t0k3n")
+        os.symlink(os.path.join(self.work, "secrets"),
+                   os.path.join(self.work, "alias"))
+        snap = hook.snapshot_tree(self.base, self.work, self.salt, "memo-e2e")
+        self.assertTrue(snap["secrets/token.txt"]["redacted"])
+        self.assertTrue(snap["secrets/token.txt"]["sha"].startswith("S:"))
+
+
+class TestManifestDumpSkip(StoreTestCase):
+    def test_unchanged_tree_does_not_rewrite_manifest(self):
+        # #7 HIGH (cheap win): a no-change snapshot must not re-dump the O(N)
+        # manifest JSON. os.replace gives the file a new inode + mtime, so an
+        # unchanged stat proves the dump was skipped.
+        self.wf("a.txt", b"a")
+        self.wf("b.txt", b"b")
+        hook.snapshot_tree(self.base, self.work, self.salt, "mskip")
+        mpath = hook.manifest_path(self.base, "mskip")
+        st1 = os.stat(mpath)
+        hook.snapshot_tree(self.base, self.work, self.salt, "mskip")  # warm, no change
+        st2 = os.stat(mpath)
+        self.assertEqual((st1.st_ino, st1.st_mtime_ns),
+                         (st2.st_ino, st2.st_mtime_ns))
+        # A real change must still refresh the manifest.
+        self.wf("c.txt", b"c")
+        hook.snapshot_tree(self.base, self.work, self.salt, "mskip")
+        manifest = hook.load_manifest(self.base, "mskip")
+        self.assertIn(os.path.join(self.work, "c.txt"), manifest)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

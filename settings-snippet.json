@@ -17,7 +17,16 @@
     "",
     "UserPromptSubmit / Stop carry no tool_name, so they take no matcher.",
     "Set ALOG_DATA to change the store location (default: <cwd>/.alog).",
-    "Set ALOG_DEBUG=1 to print the hook's internal log to stderr."
+    "Set ALOG_DEBUG=1 to print the hook's internal log to stderr.",
+    "",
+    "LARGE-TREE CAUTION: Bash events snapshot the WHOLE work tree, and every new",
+    "session's first Bash command pays a cold full-tree read+hash. Wiring this",
+    "block globally (~/.claude/settings.json) runs it wherever you start Claude",
+    "Code -- in a very large directory the snapshot exceeds the built-in ceilings",
+    "(ALOG_MAX_TREE_FILES, default 20000 files; ALOG_MAX_TREE_SECONDS, default 3s)",
+    "and is SKIPPED, recorded as a tree_snapshot_skipped event. Prefer per-project",
+    "wiring (.claude/settings.json) for big workspaces; set either variable to 0",
+    "to disable that ceiling."
   ],
   "hooks": {
     "PreToolUse": [

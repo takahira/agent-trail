@@ -10,8 +10,12 @@ Reads the local NDJSON event log and reports, fully offline:
   alog cost       per-model token usage + estimated cost for the session
   alog sessions   list recorded sessions
 
-The timeline also carries two non-tool event kinds git never sees: ``prompt``
-(what the agent was asked, redacted) and ``turn`` (per-message token usage).
+The timeline also carries non-tool event kinds git never sees: ``prompt``
+(what the agent was asked, redacted), ``turn`` (per-message token usage), and
+two GAP markers -- ``tree_snapshot_skipped`` (a whole-tree snapshot the hook
+skipped because a walk ceiling was hit) and ``events_dropped`` (events lost to
+session-lock timeouts) -- so a hole in the audit reads as a hole, never as a
+false all-clear.
 ``cost`` derives dollars from the recorded tokens and the MODEL_PRICING table in
 this file -- a rough estimate, not a billing source; tokens are the ground truth.
 
@@ -305,6 +309,18 @@ def render_nontool(ev: Dict, show_time: bool, multi: bool) -> str:
         text = _safe_inline(ev.get("prompt") or "")
         shown = text[:65] + "…" if len(text) > 65 else text
         return '{0}{1:<7} "{2}"'.format(head, "prompt", shown)
+    if ev.get("kind") == "tree_snapshot_skipped":
+        # A whole-tree snapshot the hook SKIPPED (walk ceiling): the audit has a
+        # gap here -- changes made by this command were not captured.
+        return ("{0}{1:<7} {2}-snapshot skipped: {3} ceiling"
+                " ({4} files seen) -- tree changes NOT captured").format(
+            head, "skip", _safe_inline(ev.get("phase") or "?"),
+            _safe_inline(ev.get("reason") or "?"), _num(ev.get("files_seen")))
+    if ev.get("kind") == "events_dropped":
+        # Events lost to session-lock timeouts: a gap, not an all-clear.
+        return ("{0}{1:<7} {2} event(s) dropped on session-lock timeout"
+                " -- accesses in the gap were NOT recorded").format(
+            head, "dropped", _num(ev.get("count")))
     # turn
     cost = turn_cost(ev)
     cost_s = "~${0:.4f}".format(cost) if cost is not None else "cost: price n/a"
@@ -462,9 +478,10 @@ def cmd_show(base: str, session: Optional[str], show_time: bool) -> int:
     n_sens = 0
     for ev in events:
         kind = ev.get("kind")
-        if kind in ("prompt", "turn"):
-            # Non-tool events (what was asked / token cost) sit inline in the
-            # timeline by seq; they carry no file changes so we render + skip.
+        if kind in ("prompt", "turn", "tree_snapshot_skipped", "events_dropped"):
+            # Non-tool events (what was asked / token cost / recorded GAPS) sit
+            # inline in the timeline by seq; they carry no file changes so we
+            # render + skip.
             print(render_nontool(ev, show_time, multi))
             continue
         tool = _safe_inline(ev.get("tool") or "?")   # also strips ANSI from a crafted

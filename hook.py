@@ -111,6 +111,59 @@ TREE_SKIP_DIRS = {".git", ".alog", "node_modules", ".venv", "venv",
 # (size + mtime + ctime), which still detects changes. Bounds hook I/O & memory.
 MAX_HASH_BYTES = 10 * 1024 * 1024
 
+# Whole-tree snapshot ceilings (issue #5). MAX_HASH_BYTES bounds one FILE, but the
+# Bash tree walk itself was unbounded: wired at a huge directory root it re-walked
+# and re-hashed the whole tree on EVERY Bash command (the 2026-07-21 unwiring
+# incident), and the per-session manifest means every NEW session pays the cold
+# scan again. When either ceiling is exceeded the tree snapshot for that event is
+# SKIPPED and the gap is recorded loudly: a distinct ``tree_snapshot_skipped``
+# event line lands in the log (the audit must never show a silent all-clear) and a
+# one-line warning goes to stderr under ALOG_DEBUG. Both are configurable via env
+# vars; a value <= 0 disables that ceiling.
+DEFAULT_MAX_TREE_FILES = 20000       # ALOG_MAX_TREE_FILES
+DEFAULT_MAX_TREE_SECONDS = 3.0       # ALOG_MAX_TREE_SECONDS
+# During the hashing loop the deadline is re-checked every N files, so the check
+# itself stays cheap while a stall inside hashing is still caught promptly.
+_TREE_DEADLINE_CHECK_EVERY = 64
+
+
+def tree_max_files() -> int:
+    """File-count ceiling for one whole-tree snapshot (0 = disabled)."""
+    raw = os.environ.get("ALOG_MAX_TREE_FILES")
+    if raw is None:
+        return DEFAULT_MAX_TREE_FILES
+    try:
+        val = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_TREE_FILES
+    return max(0, val)
+
+
+def tree_max_seconds() -> float:
+    """Elapsed-time budget for one whole-tree snapshot (0 = disabled)."""
+    raw = os.environ.get("ALOG_MAX_TREE_SECONDS")
+    if raw is None:
+        return DEFAULT_MAX_TREE_SECONDS
+    try:
+        val = float(raw)
+    except ValueError:
+        return DEFAULT_MAX_TREE_SECONDS
+    if not math.isfinite(val):
+        return DEFAULT_MAX_TREE_SECONDS
+    return max(0.0, val)
+
+
+class TreeCeilingExceeded(Exception):
+    """The whole-tree snapshot hit a ceiling; the snapshot for this event is
+    skipped and the gap is recorded (never silently hidden)."""
+
+    def __init__(self, reason: str, files_seen: int, elapsed: float):
+        super().__init__("tree snapshot ceiling: {0} ({1} files, {2:.3f}s)".format(
+            reason, files_seen, elapsed))
+        self.reason = reason            # "file_count" | "time_budget"
+        self.files_seen = files_seen
+        self.elapsed = elapsed
+
 # Sensitive-file matching. Bias: PRECISE (few false positives) over exhaustive.
 # Detection here is non-blocking -- a missed file is still logged as an access
 # when read via the Read tool; the point is the secret-content-at-rest guard and
@@ -604,13 +657,45 @@ def abspath_has_sensitive_dir(abs_path: str) -> bool:
     return any(seg in parts for seg in SENSITIVE_DIR_SEGMENTS_ABS)
 
 
-def path_is_sensitive(ap: str, disp: str, cwd: str) -> bool:
+def _realpath_cached(ap: str, cache: Optional[Dict[str, str]]) -> str:
+    """``os.path.realpath(ap)`` with per-PARENT-DIRECTORY memoization.
+
+    ``realpath`` walks every path component with an ``lstat``-class syscall, so
+    calling it per file made the whole-tree snapshot pay path-depth syscalls x
+    every file x twice per Bash command (issue #7) -- the dominant cost on a
+    manifest-warm tree, where nothing is re-hashed. Files share parents, so
+    resolving each DIRECTORY once and joining the basename is equivalent for a
+    non-symlink final component (realpath resolves the parent, then appends a
+    non-link basename verbatim). A final component that IS a symlink -- or an
+    odd ''/'.'/'..' basename -- falls back to the full resolution, so the
+    classification verdict never changes, only the syscall count."""
+    if cache is None:
+        return os.path.realpath(ap)
+    parent, name = os.path.split(ap)
+    if not parent or not name or name in (".", ".."):
+        return os.path.realpath(ap)
+    rparent = cache.get(parent)
+    if rparent is None:
+        rparent = os.path.realpath(parent)
+        cache[parent] = rparent
+    if os.path.islink(ap):          # rare: resolve the link itself in full
+        return os.path.realpath(os.path.join(rparent, name))
+    return os.path.join(rparent, name)
+
+
+def path_is_sensitive(ap: str, disp: str, cwd: str,
+                      rcwd: Optional[str] = None,
+                      rp_cache: Optional[Dict[str, str]] = None) -> bool:
     """Full sensitivity classification for a snapshot: the display name/segments, an
     unambiguous ancestor dot-dir, OR -- resolving SYMLINKED ANCESTORS -- the real
     target's location. A symlinked parent (alias -> secrets/) makes the LEXICAL path
     non-sensitive while the bytes actually live under a sensitive dir; O_NOFOLLOW only
     guards the FINAL component, so os.open still follows the parent and would store the
-    target. (realpath is best-effort: a concurrent swap of the ancestor is raceable.)"""
+    target. (realpath is best-effort: a concurrent swap of the ancestor is raceable.)
+
+    ``rcwd``/``rp_cache`` let a whole-tree caller (snapshot_tree) resolve the cwd
+    ONCE per snapshot and memoize ancestor resolution per parent directory,
+    instead of paying path-depth lstat calls x2 for every file (issue #7)."""
     if is_sensitive(disp):
         return True
     if abspath_has_sensitive_dir(os.path.abspath(ap)):
@@ -620,8 +705,9 @@ def path_is_sensitive(ap: str, disp: str, cwd: str) -> bool:
     # ancestor segment -- only a symlink WITHIN the path (alias -> secrets/) then
     # surfaces a sensitive segment in the relative form.
     try:
-        rp = os.path.realpath(ap)
-        rcwd = os.path.realpath(cwd)
+        rp = _realpath_cached(ap, rp_cache)
+        if rcwd is None:
+            rcwd = os.path.realpath(cwd)
     except OSError:
         return False
     if abspath_has_sensitive_dir(rp) or is_sensitive(rel_to_cwd(rcwd, rp)):
@@ -931,15 +1017,29 @@ def rel_to_cwd(cwd: str, abs_path: str) -> str:
     return abs_path
 
 
-def walk_worktree(cwd: str, store_base: Optional[str] = None) -> List[str]:
+def walk_worktree(cwd: str, store_base: Optional[str] = None,
+                  max_files: Optional[int] = None,
+                  deadline: Optional[float] = None) -> List[str]:
     # ``store_base`` is the audit store's own directory (data_dir()); it is pruned
     # from the walk by ABSOLUTE PATH, not by the hardcoded name '.alog'. With
     # ALOG_DATA pointing at an in-repo dir under any other name, the old name-only
     # skip walked (and re-hashed) the growing store itself on every Bash --
     # quadratic growth, plus digesting the salt file with itself.
+    #
+    # ``max_files`` / ``deadline`` (time.monotonic epoch) are the issue-#5 ceilings:
+    # the walk STOPS as soon as either is exceeded (raising TreeCeilingExceeded, so
+    # the caller can skip the snapshot loudly) instead of grinding through an
+    # arbitrarily large tree. Both default to None (unbounded) for direct callers;
+    # snapshot_tree passes the ALOG_MAX_TREE_* values.
     skip_abs = os.path.abspath(store_base) if store_base else None
+    start = time.monotonic()
     out = []
     for root, dirs, files in os.walk(cwd, followlinks=False):
+        # One deadline check per directory: cheap, and a huge single directory is
+        # still bounded by the max_files check inside the file loop below.
+        if deadline is not None and time.monotonic() > deadline:
+            raise TreeCeilingExceeded("time_budget", len(out),
+                                      time.monotonic() - start)
         # A symlink to a directory shows up in `dirs`. Record it (so a Bash symlink
         # swap is visible) but never descend it; real subdirs (minus the skip list)
         # stay for traversal.
@@ -952,6 +1052,9 @@ def walk_worktree(cwd: str, store_base: Optional[str] = None) -> List[str]:
                 continue                       # the audit store itself -- never walk it
             if os.path.islink(dp):
                 out.append(dp)
+                if max_files is not None and len(out) > max_files:
+                    raise TreeCeilingExceeded("file_count", len(out),
+                                              time.monotonic() - start)
             else:
                 keep.append(d)
         dirs[:] = keep
@@ -967,6 +1070,14 @@ def walk_worktree(cwd: str, store_base: Optional[str] = None) -> List[str]:
             # device) are still skipped.
             if stat.S_ISLNK(st.st_mode) or stat.S_ISREG(st.st_mode):
                 out.append(abs_path)
+                if max_files is not None and len(out) > max_files:
+                    raise TreeCeilingExceeded("file_count", len(out),
+                                              time.monotonic() - start)
+                if (deadline is not None
+                        and len(out) % _TREE_DEADLINE_CHECK_EVERY == 0
+                        and time.monotonic() > deadline):
+                    raise TreeCeilingExceeded("time_budget", len(out),
+                                              time.monotonic() - start)
     return out
 
 
@@ -1070,11 +1181,39 @@ def snapshot_tree(base: str, cwd: str, salt: bytes,
     mtime (touch -r / cp -p) still bumps ctime, so a stale record can't be reused
     for a changed file -- the reuse stays as safe as a full re-hash for any real
     write. The cache only ever SAVES a read; every entry is re-validated by stat.
+
+    CEILINGS (issue #5): raises TreeCeilingExceeded when the ALOG_MAX_TREE_FILES /
+    ALOG_MAX_TREE_SECONDS budget is exceeded (in the walk OR in the hashing loop
+    below -- on a cold manifest the hashing dominates). The caller skips the tree
+    snapshot for this event and records the gap; the manifest on disk is left
+    UNTOUCHED, so an aborted snapshot never evicts the warm cache. The file-count
+    ceiling also naturally bounds the manifest's entry count (issue #7).
     """
+    max_files = tree_max_files()
+    max_seconds = tree_max_seconds()
+    start = time.monotonic()
+    deadline = start + max_seconds if max_seconds > 0 else None
     manifest = load_manifest(base, session)
     snap: Dict[str, Optional[Dict]] = {}
     new_manifest: Dict[str, Dict] = {}
-    for ap in walk_worktree(cwd, base):
+    # Resolve cwd ONCE and memoize ancestor realpath per parent dir (issue #7):
+    # per-file realpath cost path-depth lstat x2 per file per snapshot, which
+    # dominated manifest-warm snapshots. OSError here mirrors the old per-file
+    # guard: leave rcwd unresolved and path_is_sensitive degrades the same way.
+    rp_cache: Dict[str, str] = {}
+    try:
+        rcwd: Optional[str] = os.path.realpath(cwd)
+    except OSError:
+        rcwd = None
+    processed = 0
+    for ap in walk_worktree(cwd, base, max_files=max_files or None,
+                            deadline=deadline):
+        processed += 1
+        if (deadline is not None
+                and processed % _TREE_DEADLINE_CHECK_EVERY == 0
+                and time.monotonic() > deadline):
+            raise TreeCeilingExceeded("time_budget", processed,
+                                      time.monotonic() - start)
         disp = rel_to_cwd(cwd, ap)
         # Key the cache by ABSOLUTE path, not the cwd-relative display path: one
         # session can span multiple cwds with a shared store, and two distinct
@@ -1097,7 +1236,7 @@ def snapshot_tree(base: str, cwd: str, salt: bytes,
         # virtually never set, so the reuse cache stays fully effective.
         racy = (st.st_mtime_ns % 1_000_000_000 == 0
                 or st.st_ctime_ns % 1_000_000_000 == 0)
-        cur_sensitive = path_is_sensitive(ap, disp, cwd)
+        cur_sensitive = path_is_sensitive(ap, disp, cwd, rcwd, rp_cache)
         cached_rec = cached.get("rec") if isinstance(cached, dict) else None
         if (not racy and isinstance(cached, dict) and cached.get("key") == key
                 and _reusable_rec(cached_rec, cur_sensitive)):
@@ -1106,7 +1245,12 @@ def snapshot_tree(base: str, cwd: str, salt: bytes,
             rec = snapshot_file(ap, salt, cur_sensitive)
         snap[disp] = rec
         new_manifest[mkey] = {"key": key, "rec": rec}
-    save_manifest(base, session, new_manifest)
+    # Skip the O(N) JSON dump + atomic replace when nothing changed since the last
+    # snapshot (the common warm case: a Bash command that wrote nothing). Reused
+    # entries keep the loaded dict identity, so equality is cheap and exact; this
+    # halves the manifest dumps of an idle Pre/Post pair (issue #7).
+    if new_manifest != manifest:
+        save_manifest(base, session, new_manifest)
     return snap
 
 
@@ -1150,6 +1294,55 @@ def _safe_session(session) -> str:
 LOCK_ACQUIRE_TIMEOUT = 10.0
 
 
+def _dropped_counter_path(base: str, safe: str) -> str:
+    """Counter file recording session-lock-timeout drops: one byte per dropped
+    event (its SIZE is the count). Appends are atomic (O_APPEND), so concurrent
+    droppers never lose each other's mark without any locking -- which is the
+    point: this path runs exactly when the lock could NOT be taken."""
+    return os.path.join(base, "locks", safe + ".dropped")
+
+
+def _record_dropped_event(base: str, safe: str) -> None:
+    """Mark one event as dropped (lock timeout). Best-effort and fail-open: a
+    failure to record the drop must never turn the drop into a crash."""
+    with contextlib.suppress(OSError):
+        fd = os.open(_dropped_counter_path(base, safe),
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND | _SAFE_STORE_OPEN,
+                     0o600)
+        try:
+            os.write(fd, b"1")
+        finally:
+            os.close(fd)
+
+
+def _flush_dropped_events(base: str, session: str) -> None:
+    """Called under the session lock, before the next event is written: if any
+    events were dropped on lock timeout, append ONE ``events_dropped`` marker so
+    the audit log records the gap -- a silent gap would read as "no access
+    happened", a false all-clear (issue #7). Best-effort: a drop recorded between
+    the size read and the truncate below is lost (it required a concurrent
+    timeout in that microsecond window; the semantics stay fail-open)."""
+    safe = _safe_session(session)
+    path = _dropped_counter_path(base, safe)
+    try:
+        count = os.path.getsize(path)
+    except OSError:
+        return                                    # no counter file -> no drops
+    if count <= 0:
+        return
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        _append_event(base, session, {
+            "seq": next_seq(base, session),
+            "session": session,
+            "kind": "events_dropped",
+            "ts": now_ts(base),
+            "count": int(count),
+            "reason": "session_lock_timeout",
+        })
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC | _SAFE_STORE_OPEN, 0o600)
+        os.close(fd)
+
+
 @contextlib.contextmanager
 def session_lock(base: str, session: str):
     safe = _safe_session(session)
@@ -1166,8 +1359,15 @@ def session_lock(base: str, session: str):
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     log_internal("session lock busy {0}; dropping event".format(safe))
+                    # Record the drop so the NEXT successful writer appends an
+                    # ``events_dropped`` marker -- the gap must not be silent.
+                    _record_dropped_event(base, safe)
                     raise TimeoutError("session lock busy: " + safe)
                 time.sleep(0.02)
+        # Holding the lock: surface any drops recorded by earlier timed-out
+        # writers before this event is appended (fail-open on its own errors).
+        with contextlib.suppress(Exception):
+            _flush_dropped_events(base, session)
         yield
     finally:
         if acquired:
@@ -1638,6 +1838,27 @@ def _snapshot(base: str, tool: str, tool_input: Dict, cwd: str, salt: bytes,
     return snapshot_set(files_of_interest(tool, tool_input, cwd), cwd, salt)
 
 
+def _tree_skip_event(base: str, session: str, phase: str, tool: str,
+                     tool_use_id: Optional[str],
+                     exc: "TreeCeilingExceeded") -> Dict:
+    """The distinct event line recording a SKIPPED whole-tree snapshot (issue #5):
+    the audit trail must show the gap, never a silent all-clear."""
+    return {
+        "seq": next_seq(base, session),
+        "session": session,
+        "kind": "tree_snapshot_skipped",
+        "ts": now_ts(base),
+        "tool": tool,
+        "tool_use_id": tool_use_id,
+        "phase": phase,                      # "pre" | "post"
+        "reason": exc.reason,                # "file_count" | "time_budget"
+        "files_seen": exc.files_seen,
+        "elapsed_seconds": round(exc.elapsed, 3),
+        "max_files": tree_max_files(),
+        "max_seconds": tree_max_seconds(),
+    }
+
+
 def handle_pre(base: str, payload: Dict, tool: str, cwd: str, salt: bytes,
                tool_use_id: Optional[str] = None) -> None:
     session = payload.get("session_id", "default")
@@ -1654,9 +1875,24 @@ def handle_pre(base: str, payload: Dict, tool: str, cwd: str, salt: bytes,
     nseq_at_pre = next_seq(base, session) - 1
     # Snapshot OUTSIDE the lock (see handle_post): the whole-tree Bash walk is
     # O(tree) and must not hold the per-session lock while it runs.
-    before = _snapshot(base, tool, tool_input, cwd, salt, session)
+    skip: Optional[TreeCeilingExceeded] = None
+    try:
+        before = _snapshot(base, tool, tool_input, cwd, salt, session)
+    except TreeCeilingExceeded as exc:
+        # Degrade LOUDLY (issue #5): skip the before-snapshot, record the gap as
+        # its own event line, and mark the pending record so the Post treats the
+        # before-state as unknown (never fabricating 'added' for the whole tree).
+        before = {}
+        skip = exc
+        log_internal("tree snapshot skipped (pre, {0}): {1} files in {2:.3f}s "
+                     "-- raise ALOG_MAX_TREE_FILES/ALOG_MAX_TREE_SECONDS or "
+                     "scope ALOG_DATA".format(exc.reason, exc.files_seen,
+                                              exc.elapsed))
     with session_lock(base, session):
-        push_pending(base, session, {
+        if skip is not None:
+            _append_event(base, session, _tree_skip_event(
+                base, session, "pre", tool, tool_use_id, skip))
+        record = {
             "id": tool_use_id,
             "tool": tool,
             "file_path": rel_to_cwd(cwd, fp) if fp else None,
@@ -1666,7 +1902,10 @@ def handle_pre(base: str, payload: Dict, tool: str, cwd: str, salt: bytes,
             # window.
             "nseq_at_pre": nseq_at_pre,
             "before": before,
-        })
+        }
+        if skip is not None:
+            record["before_skipped"] = True
+        push_pending(base, session, record)
 
 
 def handle_post(base: str, payload: Dict, tool: str, cwd: str, salt: bytes,
@@ -1688,12 +1927,30 @@ def handle_post(base: str, payload: Dict, tool: str, cwd: str, salt: bytes,
     # session. The lock now guards only the fast pending/seq/log mutations below; the
     # manifest cache uses atomic os.replace, so concurrent snapshots are safe (a lost
     # cache write just forces a re-read, never a wrong result).
-    after = _snapshot(base, tool, tool_input, cwd, salt, session)
+    after_skip: Optional[TreeCeilingExceeded] = None
+    try:
+        after = _snapshot(base, tool, tool_input, cwd, salt, session)
+    except TreeCeilingExceeded as exc:
+        # Degrade LOUDLY (issue #5): the after-state is unknown, so no tree diff
+        # can be built -- the tool event is still written (command string, secret
+        # scan) with empty changes and an explicit skip marker, plus a distinct
+        # ``tree_snapshot_skipped`` event line for the audit trail.
+        after = {}
+        after_skip = exc
+        log_internal("tree snapshot skipped (post, {0}): {1} files in {2:.3f}s "
+                     "-- raise ALOG_MAX_TREE_FILES/ALOG_MAX_TREE_SECONDS or "
+                     "scope ALOG_DATA".format(exc.reason, exc.files_seen,
+                                              exc.elapsed))
     with session_lock(base, session):
         pending = pop_pending(base, session, tool, named, tool_use_id)
         before = pending.get("before", {}) if pending else {}
         ts_pre = pending.get("ts") if pending else None
         matched_pre_id = pending.get("id") if pending else None
+        # A Pre whose tree snapshot was skipped pushed an EMPTY before with a
+        # marker: the before-state is unknown, so the diff must run in the
+        # had_before=False mode ('present', never a fabricated 'added').
+        before_skipped = bool(pending and pending.get("before_skipped"))
+        had_before = pending is not None and not before_skipped
         # A Bash command snapshots the whole tree; a change it observed may have
         # been produced by a CONCURRENT tool, not the command. Two overlap classes:
         #   (1) other tools whose Pre is still open (this Bash's own Pre was just
@@ -1771,9 +2028,17 @@ def handle_post(base: str, payload: Dict, tool: str, cwd: str, salt: bytes,
                         concurrent.append({"id": ev.get("tool_use_id"),
                                            "tool": "Bash", "file_path": None,
                                            "via": "posted-bash-overlap"})
-        changes = build_changes(before, after, pending is not None, named,
-                                tool == "Bash", concurrent,
-                                read_only=tool in READ_ONLY_TOOLS)
+        if after_skip is not None:
+            # After-state unknown: diffing a full 'before' against an empty
+            # 'after' would fabricate a whole-tree 'deleted'. Record no changes;
+            # the skip marker below says WHY they are absent.
+            changes: List[Dict] = []
+            _append_event(base, session, _tree_skip_event(
+                base, session, "post", tool, tool_use_id, after_skip))
+        else:
+            changes = build_changes(before, after, had_before, named,
+                                    tool == "Bash", concurrent,
+                                    read_only=tool in READ_ONLY_TOOLS)
 
         event = {
             "seq": next_seq(base, session),
@@ -1783,7 +2048,7 @@ def handle_post(base: str, payload: Dict, tool: str, cwd: str, salt: bytes,
             "matched_pre_id": matched_pre_id,
             "ts_pre": ts_pre,
             "ts": now_ts(base),
-            "had_before": pending is not None,
+            "had_before": had_before,
             "outcome": "failure" if failed else "success",
             "cwd": cwd,
             "command": redact_command(command) if command else None,
@@ -1792,6 +2057,10 @@ def handle_post(base: str, payload: Dict, tool: str, cwd: str, salt: bytes,
             "cmd_sensitive": cmd_sensitive,
             "concurrent": concurrent,
         }
+        if after_skip is not None:
+            event["snapshot_skipped"] = after_skip.reason
+        if before_skipped:
+            event["before_snapshot_skipped"] = True
         _append_event(base, session, event)
 
 
