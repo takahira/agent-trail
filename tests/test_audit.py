@@ -145,6 +145,21 @@ class TestRedaction(unittest.TestCase):
             for token in keep:
                 self.assertIn(token, out, f"{cmd!r} lost {token!r} -> {out!r}")
 
+    def test_short_db_flag_masks_quoted_values(self):
+        # Quoted values passed straight through before the '...'/"..." alternatives
+        # were added to DB_P_PASS_RE / REDIS_A_PASS_RE: the bare-value form requires
+        # a leading alnum, and a quote is not one, so `-p'Hunter2'` leaked verbatim.
+        for cmd, secret in (
+            ("mysql -uroot -p'Hunter2' db", "Hunter2"),
+            ('mysql -uroot -p"Hunter2" db', "Hunter2"),
+            ("mysqldump -uadmin -p 'sp aced' mydb", "sp aced"),
+            ('redis-cli -h 10.0.0.1 -a "S3cr3t pass" ping', "S3cr3t"),
+            ("redis-cli -a 'MyRedisPw' ping", "MyRedisPw"),
+        ):
+            out = hook.redact_command(cmd)
+            self.assertNotIn(secret, out, cmd)
+            self.assertIn("<redacted>", out, cmd)
+
     def test_redos_is_bounded(self):
         # redaction-scan-1: the {0,40} bound + length cap kill the ReDoS that
         # made a long token take ~20s. Must finish well under a second's worth.

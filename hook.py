@@ -224,8 +224,11 @@ FLAG_SECRET_RE = re.compile(
 SSHPASS_RE = re.compile(r"(?i)(\bsshpass\s+-p\s*)(\"[^\"]*\"|'[^']*'|[^\s;|&]+)")
 # Short DB password flags, SCOPED to tools where `-p`/`-a` is unambiguously a password
 # (mysql/mariadb/mongosh -p; redis-cli -a). Deliberately NOT `docker -p` (port) or
-# `psql -p` (port). The value must start alnum so a bare `-p -e ...` (prompt form) does
-# not mask the next flag. The tool-to-flag gap is bounded ({0,300}) to stay linear.
+# `psql -p` (port). The value is either a QUOTED string ('...' / "...") or a bare run
+# that must start alnum so a bare `-p -e ...` (prompt form) does not mask the next
+# flag. The quoted alternatives (cf. SSHPASS_RE) matter: `-p'Hunter2'` passed through
+# UNmasked before they were added, because the bare form rejects a leading quote.
+# The tool-to-flag gap is bounded ({0,300}) to stay linear.
 #
 # The span from the tool name to the flag is CAPTURED (group 1) and re-emitted by the
 # substitution. It used to be left uncaptured, so the sub -- which rebuilds from the
@@ -234,9 +237,11 @@ SSHPASS_RE = re.compile(r"(?i)(\bsshpass\s+-p\s*)(\"[^\"]*\"|'[^']*'|[^\s;|&]+)"
 # connection target. That is a correctness bug for an AUDIT log, and it hit exactly the
 # commands that carry credentials. Keep the prefix captured (cf. SSHPASS_RE below).
 DB_P_PASS_RE = re.compile(
-    r"(?i)(\b(?:mysql|mysqldump|mariadb|mongosh)\b[^\n]{0,300}?)(\s-p)\s*([A-Za-z0-9][^\s;|&]*)")
+    r"(?i)(\b(?:mysql|mysqldump|mariadb|mongosh)\b[^\n]{0,300}?)(\s-p)\s*"
+    r"('[^']*'|\"[^\"]*\"|[A-Za-z0-9][^\s;|&]*)")
 REDIS_A_PASS_RE = re.compile(
-    r"(?i)(\bredis-cli\b[^\n]{0,300}?)(\s-a)\s*([A-Za-z0-9][^\s;|&]*)")
+    r"(?i)(\bredis-cli\b[^\n]{0,300}?)(\s-a)\s*"
+    r"('[^']*'|\"[^\"]*\"|[A-Za-z0-9][^\s;|&]*)")
 # curl basic-auth: `-u user:pass`, attached `-uuser:pass`, `--user user:pass`,
 # `--user=user:pass`. Require the `user:pass` colon shape so a bare -u/--user in
 # another tool isn't over-masked. Group 1 = flag+user:, group 2 = the password.
