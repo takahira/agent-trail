@@ -226,10 +226,17 @@ SSHPASS_RE = re.compile(r"(?i)(\bsshpass\s+-p\s*)(\"[^\"]*\"|'[^']*'|[^\s;|&]+)"
 # (mysql/mariadb/mongosh -p; redis-cli -a). Deliberately NOT `docker -p` (port) or
 # `psql -p` (port). The value must start alnum so a bare `-p -e ...` (prompt form) does
 # not mask the next flag. The tool-to-flag gap is bounded ({0,300}) to stay linear.
+#
+# The span from the tool name to the flag is CAPTURED (group 1) and re-emitted by the
+# substitution. It used to be left uncaptured, so the sub -- which rebuilds from the
+# flag group onward -- silently dropped everything the match had consumed before it:
+# `mysql -uroot -pHunter2 db` became ` -p<redacted> db`, losing the tool name and the
+# connection target. That is a correctness bug for an AUDIT log, and it hit exactly the
+# commands that carry credentials. Keep the prefix captured (cf. SSHPASS_RE below).
 DB_P_PASS_RE = re.compile(
-    r"(?i)\b(?:mysql|mysqldump|mariadb|mongosh)\b[^\n]{0,300}?(\s-p)\s*([A-Za-z0-9][^\s;|&]*)")
+    r"(?i)(\b(?:mysql|mysqldump|mariadb|mongosh)\b[^\n]{0,300}?)(\s-p)\s*([A-Za-z0-9][^\s;|&]*)")
 REDIS_A_PASS_RE = re.compile(
-    r"(?i)\bredis-cli\b[^\n]{0,300}?(\s-a)\s*([A-Za-z0-9][^\s;|&]*)")
+    r"(?i)(\bredis-cli\b[^\n]{0,300}?)(\s-a)\s*([A-Za-z0-9][^\s;|&]*)")
 # curl basic-auth: `-u user:pass`, attached `-uuser:pass`, `--user user:pass`,
 # `--user=user:pass`. Require the `user:pass` colon shape so a bare -u/--user in
 # another tool isn't over-masked. Group 1 = flag+user:, group 2 = the password.
@@ -683,8 +690,8 @@ def _apply_secret_subs(text: str, prose: bool = False) -> str:
     out = AUTH_HEADER_RE.sub(lambda m: m.group(1) + "<redacted>", out)
     out = ARG_SECRET_RE.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", out)
     out = SSHPASS_RE.sub(lambda m: m.group(1) + "<redacted>", out)
-    out = DB_P_PASS_RE.sub(lambda m: m.group(1) + "<redacted>", out)
-    out = REDIS_A_PASS_RE.sub(lambda m: m.group(1) + "<redacted>", out)
+    out = DB_P_PASS_RE.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", out)
+    out = REDIS_A_PASS_RE.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", out)
     out = CURL_USERPASS_RE.sub(lambda m: m.group(1) + "<redacted>", out)
     out = KV_SECRET_RE.sub(lambda m: _kv_sub(m, prose), out)
     out = URL_CRED_RE.sub(lambda m: m.group(1) + "<redacted>" + m.group(3), out)

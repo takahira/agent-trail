@@ -125,6 +125,26 @@ class TestRedaction(unittest.TestCase):
     def test_token_shapes(self):
         self.assertNotIn("ABCDEF123456", hook.redact_command("h Bearer ABCDEF123456"))
 
+    def test_short_db_flag_keeps_the_command_prefix(self):
+        # The DB/redis short-flag rules used to rebuild from the flag group only, so the
+        # span the regex had already consumed (tool name, user, host) was dropped:
+        # `mysql -uroot -pHunter2 db` -> ` -p<redacted> db`. For an AUDIT log that loses
+        # *what ran and where it connected* on exactly the credential-bearing commands.
+        for cmd, secret, keep in (
+            ("mysql -uroot -pHunter2 db", "Hunter2", ("mysql", "-uroot", "db")),
+            ("mysqldump --single-transaction -uadmin -pP4ss mydb", "P4ss",
+             ("mysqldump", "--single-transaction", "-uadmin", "mydb")),
+            ("mariadb -h db.internal -pS3cr3t app", "S3cr3t", ("mariadb", "db.internal")),
+            ("mongosh -u admin -pTopSecret cluster0", "TopSecret", ("mongosh", "cluster0")),
+            ("redis-cli -h 10.0.0.1 -a Sup3rSecret ping", "Sup3rSecret",
+             ("redis-cli", "10.0.0.1", "ping")),
+        ):
+            out = hook.redact_command(cmd)
+            self.assertNotIn(secret, out, cmd)
+            self.assertIn("<redacted>", out, cmd)
+            for token in keep:
+                self.assertIn(token, out, f"{cmd!r} lost {token!r} -> {out!r}")
+
     def test_redos_is_bounded(self):
         # redaction-scan-1: the {0,40} bound + length cap kill the ReDoS that
         # made a long token take ~20s. Must finish well under a second's worth.
