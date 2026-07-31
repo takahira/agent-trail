@@ -1435,7 +1435,51 @@ class TestTranscriptSymlink(StoreTestCase):
     def test_cursor_advances_after_stop(self):
         real = self._transcript("t.jsonl")
         hook.handle_stop(self.base, {"session_id": "s", "transcript_path": real})
-        self.assertGreater(hook.read_cursor(self.base, "s"), 0)
+        self.assertGreater(hook.read_cursor(self.base, "s", real), 0)
+
+
+class TestCursorFileIdentity(StoreTestCase):
+    """Issue #6 (Low): the cursor is keyed by session_id only, so a session whose
+    transcript FILE changes must not inherit the old file's offset."""
+
+    def _transcript(self, name, message_id):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "assistant", "message": {
+                "id": message_id, "model": "claude-opus-4-8",
+                "usage": {"output_tokens": 9}}}) + "\n")
+        return p
+
+    def test_cursor_resets_when_transcript_path_changes(self):
+        a = self._transcript("a.jsonl", "m1")
+        hook.handle_stop(self.base, {"session_id": "s", "transcript_path": a})
+        self.assertGreater(hook.read_cursor(self.base, "s", a), 0)
+        # Same session, different transcript file: the stored offset must not apply.
+        b = self._transcript("b.jsonl", "m2")
+        self.assertEqual(hook.read_cursor(self.base, "s", b), 0)
+        # And handle_stop on the new file records its turn from byte 0.
+        hook.handle_stop(self.base, {"session_id": "s", "transcript_path": b})
+        turns = [e for e in alog.load_events(self.base, "s")
+                 if e.get("kind") == "turn"]
+        self.assertEqual([t["message_id"] for t in turns], ["m1", "m2"])
+        # The cursor now belongs to the new path.
+        self.assertGreater(hook.read_cursor(self.base, "s", b), 0)
+        self.assertEqual(hook.read_cursor(self.base, "s", a), 0)
+
+    def test_legacy_cursor_without_path_resets_to_zero(self):
+        # A cursor written by an older version has no "path" field: reading it
+        # must reset to 0 (safe side -- a re-read is deduped by the turn gate).
+        a = self._transcript("a.jsonl", "m1")
+        cur = hook._cursor_path(self.base, "s")
+        with open(cur, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"offset": 5}))
+        self.assertEqual(hook.read_cursor(self.base, "s", a), 0)
+
+    def test_cursor_write_records_path(self):
+        hook.write_cursor(self.base, "s", 42, "/t/x.jsonl")
+        with open(hook._cursor_path(self.base, "s"), encoding="utf-8") as fh:
+            obj = json.loads(fh.read())
+        self.assertEqual(obj, {"offset": 42, "path": "/t/x.jsonl"})
 
 
 class TestTier1SecurityFixes(StoreTestCase):
@@ -1673,10 +1717,10 @@ class TestTier5678Fixes(StoreTestCase):
         self.assertEqual(os.stat(log).st_mode & 0o077, 0, "log must re-tighten to 0600")
 
     def test_t6b_cursor_permissions_self_heal(self):
-        hook.write_cursor(self.base, "s", 10)
+        hook.write_cursor(self.base, "s", 10, "/t/a.jsonl")
         cur = hook._cursor_path(self.base, "s")
         os.chmod(cur, 0o644)
-        hook.write_cursor(self.base, "s", 20)
+        hook.write_cursor(self.base, "s", 20, "/t/a.jsonl")
         self.assertEqual(os.stat(cur).st_mode & 0o077, 0)
 
     # ---- Tier 7a: prose with trailing punctuation is not over-masked ----

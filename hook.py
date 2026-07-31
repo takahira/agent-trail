@@ -1928,25 +1928,35 @@ def _cursor_path(base: str, session: str) -> str:
     return os.path.join(base, "cursors", _safe_session(session) + ".json")
 
 
-def read_cursor(base: str, session: str) -> int:
-    """Transcript byte offset already processed for this session (0 if none)."""
+def read_cursor(base: str, session: str, tpath: str) -> int:
+    """Transcript byte offset already processed for this session (0 if none).
+
+    The cursor is keyed by session_id, but the transcript FILE behind a session
+    can change (e.g. a resumed session writing a new transcript path). The saved
+    offset is only meaningful for the file it was taken from, so the cursor also
+    records the transcript path and any mismatch resets to 0. A legacy cursor
+    (offset only, no path -- written by older versions) resets the same way:
+    re-reading is safe (recorded_turn_ids is the dedup gate), trusting a stale
+    offset against a different file is not."""
     try:
         with safe_store_read(_cursor_path(base, session), "r", encoding="utf-8") as fh:
             obj = json.loads(fh.read() or "{}")
     except (OSError, ValueError):
         return 0
-    off = obj.get("offset") if isinstance(obj, dict) else None
+    if not isinstance(obj, dict) or obj.get("path") != tpath:
+        return 0
+    off = obj.get("offset")
     return off if isinstance(off, int) and off >= 0 else 0
 
 
-def write_cursor(base: str, session: str, offset: int) -> None:
-    """Persist the processed transcript offset (0600). Best-effort I/O hint."""
+def write_cursor(base: str, session: str, offset: int, tpath: str) -> None:
+    """Persist the processed transcript offset + path (0600). Best-effort I/O hint."""
     fd = os.open(_cursor_path(base, session),
                  os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _SAFE_STORE_OPEN, 0o600)
     with contextlib.suppress(OSError):   # self-heal an existing cursor's perms
         os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"offset": int(offset)}))
+        fh.write(json.dumps({"offset": int(offset), "path": tpath}))
 
 
 def handle_user_prompt(base: str, payload: Dict) -> None:
@@ -1991,7 +2001,7 @@ def handle_stop(base: str, payload: Dict) -> None:
     # discipline in handle_pre/handle_post). recorded_turn_ids (taken under the lock
     # below) is the real dedup GATE, so a concurrent Stop re-reading the same bytes
     # is harmless -- it just writes nothing.
-    offset = read_cursor(base, session)
+    offset = read_cursor(base, session, tpath)
     turns, new_offset = parse_transcript_turns(tpath, offset)
     with session_lock(base, session):
         # recorded_turn_ids is the dedup GATE (log = source of truth); the cursor is
@@ -2017,7 +2027,7 @@ def handle_stop(base: str, payload: Dict) -> None:
                 "cache_read_input_tokens": t["cache_read_input_tokens"],
             })
             seq += 1
-        write_cursor(base, session, new_offset)
+        write_cursor(base, session, new_offset, tpath)
 
 
 def main() -> int:
