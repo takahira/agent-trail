@@ -91,6 +91,7 @@ The one `hook.py` handles every event (it dispatches on `hook_event_name`). Merg
 | Event | What it records |
 | --- | --- |
 | `PreToolUse` / `PostToolUse` | before/after snapshot around `Write`/`Edit`/`Read`/`NotebookEdit`/`MultiEdit` (single-file) and `Bash` (whole work-tree) |
+| `PostToolUseFailure` | same after-snapshot as `PostToolUse`, recorded as failed, when a tool errors — **strongly recommended**: without it, partial writes left behind by a failed command are never captured (omit only if your Claude Code version predates this event) |
 | `UserPromptSubmit` | your prompt, with inline secrets redacted |
 | `Stop` / `SubagentStop` | per-turn token usage read from the transcript |
 
