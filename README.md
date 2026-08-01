@@ -86,7 +86,10 @@ pipx install git+https://github.com/takahira/agent-trail.git   # gives you `alog
 The one `hook.py` handles every event (it dispatches on `hook_event_name`). Merge
 [`settings-snippet.json`](settings-snippet.json) into `~/.claude/settings.json`
 (global) or `.claude/settings.json` (per project), replacing
-`/ABSOLUTE/PATH/TO/hook.py` with the absolute path to `hook.py` in your clone:
+`/ABSOLUTE/PATH/TO/hook.py` with the absolute path to `hook.py` in your clone.
+The snippet uses the **exec form** (`"command": "python3"` plus an `args`
+array) on purpose: the shell form word-splits a clone path containing spaces,
+which would silently stop every audit hook from running.
 
 | Event | What it records |
 | --- | --- |

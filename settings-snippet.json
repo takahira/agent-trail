@@ -26,7 +26,12 @@
     "(ALOG_MAX_TREE_FILES, default 20000 files; ALOG_MAX_TREE_SECONDS, default 3s)",
     "and is SKIPPED, recorded as a tree_snapshot_skipped event. Prefer per-project",
     "wiring (.claude/settings.json) for big workspaces; set either variable to 0",
-    "to disable that ceiling."
+    "to disable that ceiling.",
+    "",
+    "EXEC FORM (command + args) is deliberate: the shell form 'python3 /path/to/hook.py'",
+    "word-splits on a clone path containing spaces (e.g. /Users/you/AI Tools/agent-trail),",
+    "so NONE of the audit hooks would run. With args, the path is passed as one argv",
+    "element and never reaches a shell parser."
   ],
   "hooks": {
     "PreToolUse": [
@@ -35,7 +40,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+            "command": "python3",
+            "args": [
+              "/ABSOLUTE/PATH/TO/hook.py"
+            ]
           }
         ]
       }
@@ -46,7 +54,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+            "command": "python3",
+            "args": [
+              "/ABSOLUTE/PATH/TO/hook.py"
+            ]
           }
         ]
       }
@@ -57,7 +68,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+            "command": "python3",
+            "args": [
+              "/ABSOLUTE/PATH/TO/hook.py"
+            ]
           }
         ]
       }
@@ -67,7 +81,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+            "command": "python3",
+            "args": [
+              "/ABSOLUTE/PATH/TO/hook.py"
+            ]
           }
         ]
       }
@@ -77,7 +94,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+            "command": "python3",
+            "args": [
+              "/ABSOLUTE/PATH/TO/hook.py"
+            ]
           }
         ]
       }
@@ -87,7 +107,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /ABSOLUTE/PATH/TO/hook.py"
+            "command": "python3",
+            "args": [
+              "/ABSOLUTE/PATH/TO/hook.py"
+            ]
           }
         ]
       }

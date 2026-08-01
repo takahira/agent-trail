@@ -3365,3 +3365,97 @@ class TestSecretDirectorySegments(unittest.TestCase):
     def test_words_merely_starting_with_secret_are_not(self):
         for rel in ("docs/secretary.md", "notes/secretariat.txt", "src/main.py"):
             self.assertFalse(self._sens(rel), rel)
+
+
+class TestStoreSymlinkRefused(unittest.TestCase):
+    """#8: `.alog` symlinked at another directory got our subdirectories created
+    inside it, its permissions changed, and a file named `salt` there could be
+    overwritten by the healing path."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="agent-trail-symlink.")
+        self.victim = os.path.join(self.tmp, "victim")
+        os.makedirs(self.victim)
+        with open(os.path.join(self.victim, "salt"), "w", encoding="utf-8") as fh:
+            fh.write("important")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_symlinked_store_root_is_refused(self):
+        link = os.path.join(self.tmp, "store")
+        os.symlink(self.victim, link)
+        with self.assertRaises(hook.StorePathUnsafe):
+            hook.ensure_dirs(link)
+        # and nothing was created or clobbered in the target
+        self.assertEqual(sorted(os.listdir(self.victim)), ["salt"])
+        with open(os.path.join(self.victim, "salt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "important")
+
+    def test_symlinked_subdir_is_refused(self):
+        base = os.path.join(self.tmp, "store2")
+        os.makedirs(base)
+        os.symlink(self.victim, os.path.join(base, "sessions"))
+        with self.assertRaises(hook.StorePathUnsafe):
+            hook.ensure_dirs(base)
+        self.assertEqual(sorted(os.listdir(self.victim)), ["salt"])
+
+    def test_a_regular_file_where_the_store_should_be_is_refused(self):
+        path = os.path.join(self.tmp, "notadir")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        with self.assertRaises(hook.StorePathUnsafe):
+            hook.ensure_dirs(path)
+
+    def test_a_normal_store_still_works(self):
+        base = os.path.join(self.tmp, "ok")
+        hook.ensure_dirs(base)
+        for sub in ("sessions", "pending", "locks", "manifests", "cursors"):
+            self.assertTrue(os.path.isdir(os.path.join(base, sub)), sub)
+
+
+class TestCursorFileIdentity(StoreTestCase):
+    """#8: the cursor keyed on PATH only, so a transcript replaced at the same
+    pathname by a different file of at least the old size resumed at the old
+    offset and permanently lost every turn before it. The size clamp only catches
+    a replacement that is SHORTER."""
+
+    def _write(self, path, text):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_same_path_replacement_resets_the_cursor(self):
+        tpath = os.path.join(self.tmp, "t.jsonl")
+        self._write(tpath, "x" * 500)
+        hook.write_cursor(self.base, "s", 400, tpath)
+        self.assertEqual(hook.read_cursor(self.base, "s", tpath), 400)
+
+        # Replace with a DIFFERENT file (new inode) that is not shorter.
+        os.remove(tpath)
+        self._write(tpath, "y" * 900)
+        self.assertEqual(
+            hook.read_cursor(self.base, "s", tpath), 0,
+            "a new file at the same path must not inherit the old offset")
+
+    def test_same_file_keeps_the_cursor(self):
+        tpath = os.path.join(self.tmp, "t2.jsonl")
+        self._write(tpath, "x" * 500)
+        hook.write_cursor(self.base, "s2", 400, tpath)
+        with open(tpath, "a", encoding="utf-8") as fh:   # append: same inode
+            fh.write("z" * 100)
+        self.assertEqual(hook.read_cursor(self.base, "s2", tpath), 400,
+                         "appending must not throw the cursor away")
+
+    def test_legacy_cursor_without_identity_resets(self):
+        tpath = os.path.join(self.tmp, "t3.jsonl")
+        self._write(tpath, "x" * 100)
+        with open(hook._cursor_path(self.base, "s3"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"offset": 50, "path": tpath}))   # pre-identity
+        self.assertEqual(hook.read_cursor(self.base, "s3", tpath), 0)
+
+    def test_missing_transcript_resets(self):
+        tpath = os.path.join(self.tmp, "gone.jsonl")
+        self._write(tpath, "x" * 100)
+        hook.write_cursor(self.base, "s4", 50, tpath)
+        os.remove(tpath)
+        self.assertEqual(hook.read_cursor(self.base, "s4", tpath), 0)

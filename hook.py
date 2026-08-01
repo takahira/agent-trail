@@ -463,16 +463,58 @@ def data_dir(cwd: str) -> str:
     return os.environ.get("ALOG_DATA") or os.path.join(cwd, ".alog")
 
 
+class StorePathUnsafe(Exception):
+    """A fixed store path is a symlink (or not a directory) -- refuse to use it."""
+
+
+def _reject_symlinked_dir(path: str) -> None:
+    """Raise if ``path`` exists and is a symlink or a non-directory.
+
+    Checked with lstat (never follows), and both before and after the makedirs
+    that may create it, so a symlink planted in the window is still caught. This
+    is a check/use race in principle; closing it fully needs O_NOFOLLOW directory
+    descriptors for every subsequent operation, which is a larger change. The
+    window here is microseconds against an attacker who already needs write
+    access to the parent directory, and catching the planted-symlink case is the
+    difference between "writes into someone else's directory forever" and "one
+    unlucky race".
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        return                               # unreadable: the caller will fail loudly
+    if stat.S_ISLNK(st.st_mode):
+        raise StorePathUnsafe(
+            "{0} is a symlink; refusing to use it as an audit store".format(path))
+    if not stat.S_ISDIR(st.st_mode):
+        raise StorePathUnsafe(
+            "{0} exists and is not a directory".format(path))
+
+
 def ensure_dirs(base: str) -> None:
-    """Create the store 0700, with a 0600 .gitignore (*) so it never commits."""
+    """Create the store 0700, with a 0600 .gitignore (*) so it never commits.
+
+    The store root and every fixed subdirectory must be a REAL directory, never a
+    symlink (issue #8): `os.makedirs(exist_ok=True)` happily accepts a symlink and
+    `os.chmod` follows it, so a `.alog` symlinked at someone else's directory got
+    our subdirectories created inside it, its permissions changed, and -- via the
+    salt-healing path -- a file named `salt` there overwritten with random bytes.
+    A store we cannot trust is worse than no store, so refuse rather than repoint.
+    """
+    _reject_symlinked_dir(base)
     os.makedirs(base, mode=0o700, exist_ok=True)
+    _reject_symlinked_dir(base)          # re-check: it may have appeared just now
     with contextlib.suppress(OSError):
         os.chmod(base, 0o700)
     # NOTE: no "objects" dir -- file contents are never stored (v0.2+). A legacy
     # v0.1 store's objects/ is dead weight and can be deleted by the user.
     for sub in ("sessions", "pending", "locks", "manifests", "cursors"):
         d = os.path.join(base, sub)
+        _reject_symlinked_dir(d)
         os.makedirs(d, mode=0o700, exist_ok=True)
+        _reject_symlinked_dir(d)
         with contextlib.suppress(OSError):
             os.chmod(d, 0o700)
     gi = os.path.join(base, ".gitignore")
@@ -1337,6 +1379,19 @@ def snapshot_tree(base: str, cwd: str, salt: bytes,
             rec = snapshot_file(ap, salt, cur_sensitive)
         snap[disp] = rec
         new_manifest[mkey] = {"key": key, "rec": rec}
+    # Final deadline check, AFTER the last file (issue #8). The per-file check
+    # above happens BEFORE each read, so the last file -- or a tree with only one
+    # file -- could still overrun the budget by a whole MAX_HASH_BYTES read on a
+    # slow mount and then return as a normal, complete snapshot.
+    #
+    # This does not preempt a read already in flight; interrupting one needs a
+    # hard timer (setitimer) whose signal handling inside a hook is a much larger
+    # change. What it does guarantee is the part that matters for an audit: a
+    # snapshot that DID overrun is never returned as if it were complete -- it
+    # becomes a recorded gap like any other ceiling hit.
+    if deadline is not None and time.monotonic() > deadline:
+        raise TreeCeilingExceeded("time_budget", processed,
+                                  time.monotonic() - start)
     # Skip the O(N) JSON dump + atomic replace when nothing changed since the last
     # snapshot (the common warm case: a Bash command that wrote nothing). Reused
     # entries keep the loaded dict identity, so equality is cheap and exact; this
@@ -2289,6 +2344,15 @@ def _cursor_path(base: str, session: str) -> str:
     return os.path.join(base, "cursors", _safe_session(session) + ".json")
 
 
+def _file_identity(path: str) -> "Optional[Tuple[int, int]]":
+    """(st_dev, st_ino) for ``path``, or None if it cannot be stat'ed."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
 def read_cursor(base: str, session: str, tpath: str) -> int:
     """Transcript byte offset already processed for this session (0 if none).
 
@@ -2298,13 +2362,27 @@ def read_cursor(base: str, session: str, tpath: str) -> int:
     records the transcript path and any mismatch resets to 0. A legacy cursor
     (offset only, no path -- written by older versions) resets the same way:
     re-reading is safe (recorded_turn_ids is the dedup gate), trusting a stale
-    offset against a different file is not."""
+    offset against a different file is not.
+
+    The path alone is NOT identity (issue #8): a transcript REPLACED at the same
+    pathname by a different file of at least the old size resumed at the old
+    offset and permanently lost every turn before it. The size clamp above only
+    catches a replacement that is shorter. So the cursor also records the file's
+    dev/ino and any mismatch resets to 0.
+
+    dev/ino come from a stat of the path here rather than from the descriptor the
+    parser later opens, so a replacement landing between the two is still
+    possible; the consequence of that race is a re-read (harmless -- the dedup
+    gate is recorded_turn_ids), which is the safe direction."""
     try:
         with safe_store_read(_cursor_path(base, session), "r", encoding="utf-8") as fh:
             obj = json.loads(fh.read() or "{}")
     except (OSError, ValueError):
         return 0
     if not isinstance(obj, dict) or obj.get("path") != tpath:
+        return 0
+    ident = _file_identity(tpath)
+    if ident is None or (obj.get("dev"), obj.get("ino")) != ident:
         return 0
     off = obj.get("offset")
     return off if isinstance(off, int) and off >= 0 else 0
@@ -2316,8 +2394,12 @@ def write_cursor(base: str, session: str, offset: int, tpath: str) -> None:
                  os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _SAFE_STORE_OPEN, 0o600)
     with contextlib.suppress(OSError):   # self-heal an existing cursor's perms
         os.fchmod(fd, 0o600)
+    ident = _file_identity(tpath)
+    rec = {"offset": int(offset), "path": tpath}
+    if ident is not None:
+        rec["dev"], rec["ino"] = ident
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"offset": int(offset), "path": tpath}))
+        fh.write(json.dumps(rec))
 
 
 def handle_user_prompt(base: str, payload: Dict) -> None:
