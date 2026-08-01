@@ -20,6 +20,8 @@ import importlib.util
 import io
 import json
 import os
+import pathlib
+import re
 import shutil
 import tempfile
 import time
@@ -1281,18 +1283,52 @@ class TestPromptTurnCapture(StoreTestCase):
 
 class TestCost(unittest.TestCase):
     def test_price_for_prefix_and_unknown(self):
-        self.assertEqual(alog.price_for("claude-opus-4-8"), (15.0, 75.0, 18.75, 1.5))
+        self.assertEqual(alog.price_for("claude-opus-4-8"), (5.0, 25.0, 6.25, 0.50))
         self.assertEqual(alog.price_for("claude-haiku-4-5-20251001"),
                          (1.0, 5.0, 1.25, 0.10))
-        self.assertIsNone(alog.price_for("claude-fable-5"))
+        self.assertEqual(alog.price_for("claude-fable-5"), (10.0, 50.0, 12.5, 1.0))
         self.assertIsNone(alog.price_for(None))
+
+    def test_price_for_declines_rather_than_guessing_from_a_neighbour(self):
+        """A model absent from the official pricing page must report no price, not
+        borrow one from a neighbour. Fully-retired models are no longer listed
+        there, so they land here rather than inheriting a same-family rate."""
+        for unlisted in ("claude-opus-9", "claude-3-opus-20240229",
+                         "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307"):
+            self.assertIsNone(alog.price_for(unlisted), unlisted)
+
+    def test_modern_opus_is_not_priced_at_the_legacy_rate(self):
+        """The regression this table was rewritten for: a bare `opus` family key
+        priced 4.6/4.7/4.8/5 at the deprecated $15/$75, over-stating every modern
+        Opus turn 3x. Modern Opus is $5/$25; only 4.1 and 4 keep the old rate."""
+        for modern in ("claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+                       "claude-opus-4-6", "claude-opus-4-5"):
+            self.assertEqual(alog.price_for(modern), (5.0, 25.0, 6.25, 0.50), modern)
+        for legacy in ("claude-opus-4-1", "claude-opus-4-20250514"):
+            self.assertEqual(alog.price_for(legacy)[0], 15.0, legacy)
+
+    def test_price_for_longest_key_wins(self):
+        """`opus-4` is a substring of `opus-4-8`, so a shorter (dearer) key must not
+        shadow the exact one -- that is what makes one table serve both generations."""
+        self.assertEqual(alog.price_for("claude-opus-4-8")[0], 5.0)
+        self.assertEqual(alog.price_for("claude-opus-4-20250514")[0], 15.0)
+        self.assertEqual(alog.price_for("claude-sonnet-4-6")[0], 3.0)
+
+    def test_cache_rates_are_fixed_multiples_of_input(self):
+        """Cache write is 1.25x input and cache read 0.1x input for every row, so a
+        hand-edited table row cannot end up internally inconsistent."""
+        for model, (inp, _out, cw, cr) in alog.MODEL_PRICING.items():
+            self.assertAlmostEqual(cw, inp * 1.25, msg=model)
+            self.assertAlmostEqual(cr, inp * 0.10, msg=model)
 
     def test_turn_cost_exact(self):
         self.assertAlmostEqual(
-            alog.turn_cost({"model": "claude-opus-4-8", "input_tokens": 1_000_000}), 15.0)
+            alog.turn_cost({"model": "claude-opus-4-8", "input_tokens": 1_000_000}), 5.0)
         self.assertAlmostEqual(
             alog.turn_cost({"model": "claude-sonnet-5", "output_tokens": 1_000_000}), 15.0)
-        self.assertIsNone(alog.turn_cost({"model": "claude-fable-5",
+        self.assertAlmostEqual(
+            alog.turn_cost({"model": "claude-opus-4-1", "input_tokens": 1_000_000}), 15.0)
+        self.assertIsNone(alog.turn_cost({"model": "claude-opus-9",
                                           "input_tokens": 1_000_000}))
 
     def test_turn_tokens_sums_all_four(self):
@@ -1314,7 +1350,9 @@ class TestCostRenderCLI(StoreTestCase):
              "usage": {"input_tokens": 2, "output_tokens": 403,
                        "cache_creation_input_tokens": 35380,
                        "cache_read_input_tokens": 20380}}},
-            {"type": "assistant", "message": {"id": "m2", "model": "claude-fable-5",
+            # An unreleased version: the case the "unknown model price" column
+            # exists for. Every model that ships gets a rate; a future one has none.
+            {"type": "assistant", "message": {"id": "m2", "model": "claude-opus-9",
              "usage": {"input_tokens": 10, "output_tokens": 20}}},
         ]
         tp = os.path.join(self.tmp, "t.jsonl")
@@ -2549,10 +2587,15 @@ class TestRoundSixFixes(StoreTestCase):
         self.assertNotIn("‮", alog._safe("prod‮.env"))
         self.assertNotIn("⁦", alog._safe_inline("a⁦b"))
 
-    # ---- D2: legacy claude-3-* prices ----
+    # ---- D2: a legacy id shape (version BEFORE family) still resolves ----
     def test_d2_legacy_model_priced(self):
-        self.assertIsNotNone(alog.price_for("claude-3-5-sonnet-20241022"))
-        self.assertIsNotNone(alog.price_for("claude-3-opus-20240229"))
+        """`claude-3-5-haiku-20241022` orders the version before the family, so a
+        `haiku-3-5`-style key would never match it -- the key has to be written in
+        the legacy order. Models Anthropic no longer lists at all report no price
+        rather than borrowing a same-family rate."""
+        self.assertEqual(alog.price_for("claude-3-5-haiku-20241022")[0], 0.80)
+        for delisted in ("claude-3-5-sonnet-20241022", "claude-3-opus-20240229"):
+            self.assertIsNone(alog.price_for(delisted), delisted)
 
     # ---- AGY6-2: transcript read is bounded (no unbounded slurp) ----
     def test_bounded_transcript_read(self):
@@ -3459,3 +3502,80 @@ class TestCursorFileIdentity(StoreTestCase):
         hook.write_cursor(self.base, "s4", 50, tpath)
         os.remove(tpath)
         self.assertEqual(hook.read_cursor(self.base, "s4", tpath), 0)
+
+
+class TestSensitiveSizeNotPersisted(StoreTestCase):
+    """#8: `alog diff` suppresses a sensitive file's size, but the raw byte count
+    still sat in cleartext in the two artifacts the reader never renders -- an
+    orphaned pending Pre and the Bash tree manifest (both the cached record AND
+    its stat reuse key). That contradicted README's "sensitive files record no
+    size" and leaked a side channel on key type / token shape to anyone who could
+    read the store."""
+
+    SECRET = "ANTHROPIC_API_KEY=sk-ant-notreal-000\n"     # a distinctive length
+
+    def _raw_length_hits(self, n):
+        """Every occurrence of `n` as a standalone NUMBER anywhere in the store.
+        Scanned as a JSON number token rather than a `"size":N` substring, because
+        the manifest carries the length as a bare ARRAY element in its reuse key --
+        a field-name-anchored search walks straight past it."""
+        pat = re.compile(r"(?<![\d.])%d(?![\d.])" % n)
+        hits = []
+        for dirpath, _dirs, files in os.walk(self.base):
+            for name in files:
+                path = os.path.join(dirpath, name)
+                try:
+                    text = pathlib.Path(path).read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if pat.search(text):
+                    hits.append(os.path.relpath(path, self.base))
+        return hits
+
+    def test_no_artifact_keeps_a_sensitive_file_byte_length(self):
+        env = os.path.join(self.work, ".env")
+        with open(env, "w", encoding="utf-8") as fh:
+            fh.write(self.SECRET)
+        n = len(self.SECRET)
+        # A Read that never gets its Post (orphaned pending) + a Bash tree snapshot.
+        hook.handle_pre(self.base, {"session_id": "s1", "cwd": self.work,
+                                    "tool_input": {"file_path": env}},
+                        "Read", self.work, self.salt, "t1")
+        hook.handle_pre(self.base, {"session_id": "s2", "cwd": self.work,
+                                    "tool_input": {"command": "ls"}},
+                        "Bash", self.work, self.salt, "b1")
+        self.assertEqual(self._raw_length_hits(n), [])
+
+    def test_size_digest_still_detects_a_size_change(self):
+        """The digest replaces the number for storage only -- every consumer
+        compares sizes for equality, so change detection must survive."""
+        same = hook._size_field(self.salt, 37, True)
+        self.assertEqual(same, hook._size_field(self.salt, 37, True))
+        self.assertNotEqual(same, hook._size_field(self.salt, 38, True))
+        self.assertTrue(same.startswith("Z:"))
+
+    def test_non_sensitive_size_is_still_the_plain_number(self):
+        """Don't over-redact: a normal file's size is part of the diff story."""
+        self.assertEqual(hook._size_field(self.salt, 37, False), 37)
+        pub = os.path.join(self.work, "public.txt")
+        with open(pub, "w", encoding="utf-8") as fh:
+            fh.write("hello\n")
+        self.assertEqual(hook.snapshot_file(pub, self.salt, False)["size"], 6)
+
+    def test_diff_never_renders_a_digest_as_a_size(self):
+        """before_size/after_size are gated on the sensitive flag, so the digest
+        string must never reach the reader's size columns."""
+        env = os.path.join(self.work, ".env")
+        with open(env, "w", encoding="utf-8") as fh:
+            fh.write(self.SECRET)
+        before = {".env": hook.snapshot_file(env, self.salt, True)}
+        with open(env, "a", encoding="utf-8") as fh:
+            fh.write("EXTRA=1\n")
+        after = {".env": hook.snapshot_file(env, self.salt, True)}
+        changes = hook.build_changes(before, after, True, None)
+        self.assertEqual(len(changes), 1)
+        rec = changes[0]
+        self.assertEqual(rec["status"], "modified")     # change still detected
+        self.assertTrue(rec["sensitive"])
+        self.assertNotIn("before_size", rec)
+        self.assertNotIn("after_size", rec)

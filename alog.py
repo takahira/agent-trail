@@ -59,13 +59,54 @@ CHANGE_STATUSES = ("added", "modified", "deleted", "typechange")
 # rate. The transcript records one `cache_creation_input_tokens` total and does not
 # break it down by TTL, so a 1-hour-TTL write (a higher rate) is under-counted here.
 # This only shifts the ESTIMATE; the recorded token counts stay ground truth.
-# Keyed by FAMILY token (matched anywhere in the id) so legacy shapes like
-# `claude-3-5-sonnet-20241022` / `claude-3-opus-20240229` price correctly, not just
-# the `claude-<family>-*` form.
+# Keyed by VERSIONED model token (matched anywhere in the id, longest match wins)
+# so a dated id like `claude-haiku-4-5-20251001` prices off `haiku-4-5`.
+#
+# DELIBERATELY NOT keyed by bare family. A family key is only safe while every
+# member of that family shares one rate, and Opus does not: 4.6/4.7/4.8/5 are
+# $5/$25 while the Opus 3 / 4 / 4.1 generation was billed at the higher legacy
+# rate. A single `"opus"` tuple therefore has to be wrong for one side or the
+# other -- it used to be $15/$75, which over-stated every modern Opus turn 3x.
+# An unlisted model now reports `price n/a` (see `fmt_cost`) instead of being
+# priced off a neighbour: an absent number is honest, a wrong one is not.
+# ADDING A MODEL: put its input/output rate here from the official pricing page.
+_CACHE_WRITE_5M = 1.25   # x input rate
+_CACHE_READ = 0.10       # x input rate
+
+
+def _rates(inp: float, out: float) -> Tuple[float, float, float, float]:
+    """(input, output, cache_write_5m, cache_read) from the two published rates.
+    The cache rates are fixed multiples of input, so deriving them keeps the table
+    to the numbers the pricing page actually lists and makes an internally
+    inconsistent row impossible."""
+    return (inp, out, inp * _CACHE_WRITE_5M, inp * _CACHE_READ)
+
+
+# Rates below are the first-party Claude API list prices, transcribed from
+# https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table).
+# Partner platforms (Bedrock / Google Cloud) bill separately and are NOT modelled.
+# NOTE ON SONNET 5: an introductory $2/$10 applies through 2026-08-31, reverting to
+# the $3/$15 carried here. This table is date-independent by design, so Sonnet 5
+# turns inside that window are over-estimated. Erring high on an estimate is the
+# safe direction; a date-conditional rate is not worth the complexity here.
+# LEGACY IDS PUT THE VERSION FIRST (`claude-3-5-haiku-20241022`), so a legacy key
+# has to be written in that order -- `haiku-3-5` would never match it.
 MODEL_PRICING = {
-    "opus": (15.0, 75.0, 18.75, 1.50),
-    "sonnet": (3.0, 15.0, 3.75, 0.30),
-    "haiku": (1.0, 5.0, 1.25, 0.10),
+    "fable-5": _rates(10.0, 50.0),
+    "mythos-5": _rates(10.0, 50.0),
+    "opus-5": _rates(5.0, 25.0),
+    "opus-4-8": _rates(5.0, 25.0),
+    "opus-4-7": _rates(5.0, 25.0),
+    "opus-4-6": _rates(5.0, 25.0),
+    "opus-4-5": _rates(5.0, 25.0),
+    "opus-4-1": _rates(15.0, 75.0),     # deprecated, still billed at the old rate
+    "opus-4": _rates(15.0, 75.0),       # retired except on Google Cloud
+    "sonnet-5": _rates(3.0, 15.0),
+    "sonnet-4-6": _rates(3.0, 15.0),
+    "sonnet-4-5": _rates(3.0, 15.0),
+    "sonnet-4": _rates(3.0, 15.0),      # retired except on Bedrock / Google Cloud
+    "haiku-4-5": _rates(1.0, 5.0),
+    "3-5-haiku": _rates(0.80, 4.0),     # legacy id order; retired on 1P
 }
 PRICE_PER = 1_000_000
 TURN_TOKEN_KEYS = ("input_tokens", "output_tokens",
@@ -128,9 +169,10 @@ def _sess(ev: Dict) -> str:
 
 def price_for(model: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
     """(input, output, cache_write, cache_read) rate tuple for a model, or None
-    when the model is not a known family (a newer model whose price we don't know,
-    or a non-string value in a corrupt log -- we report tokens but decline to
-    invent a dollar figure)."""
+    when the model is not in MODEL_PRICING (a newer or legacy model whose rate we
+    have not recorded, or a non-string value in a corrupt log -- we report tokens
+    but decline to invent a dollar figure). Longest key wins, so `claude-opus-4-8`
+    cannot be priced off a shorter, cheaper-or-dearer neighbour key."""
     if not isinstance(model, str) or not model:
         return None
     m = model.lower()
@@ -165,7 +207,7 @@ _MODEL_DATE_RE = re.compile(r"-\d{8}$")
 def short_model(model: Optional[str]) -> str:
     """'claude-opus-4-8' -> 'opus-4-8'; 'claude-haiku-4-5-20251001' -> 'haiku-4-5'.
     Drops the 'claude-' prefix and any trailing -YYYYMMDD date for compact,
-    column-friendly display (family pricing keys off the family, not the date).
+    column-friendly display (pricing keys off the version, not the date).
     A non-string model (corrupt log) renders as '?'."""
     if not isinstance(model, str) or not model:
         return "?"

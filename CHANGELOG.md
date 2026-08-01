@@ -1,5 +1,68 @@
 # Changelog
 
+## Unreleased
+
+Follow-up fixes from the round-8 audit (#8). No format or CLI break: an existing
+store keeps working, and the one on-disk change (below) costs at most a single
+re-hash the first time a sensitive file is seen again.
+
+### An audit gap no longer renders as a clean bill of health
+
+`alog audit --fail-on-hit` and `alog diff` printed their normal "(none)" result
+over a session whose snapshot had been **skipped** for exceeding a ceiling. Wired
+into CI that is a green light over an audit that could not see. Both commands now
+print any `tree_snapshot_skipped` / `events_dropped` before their results, and
+`--fail-on-hit` exits **3** when the audit is incomplete -- kept distinct from the
+existing 2, because "a secret was touched" and "we cannot say whether one was"
+need different responses.
+
+### The tree walk actually enforces its ceilings
+
+`os.walk` materialises a directory's entire `scandir` result before yielding, so a
+single directory holding millions of entries blew past both ceilings -- and could
+exhaust memory -- before any check ran. Replaced with an explicit `os.scandir`
+traversal that tests the ceilings while consuming each entry. Traversal and stat
+errors are no longer swallowed: an unreadable subtree is recorded as a
+`walk_error` gap instead of reading as "nothing changed".
+
+### Store integrity
+
+- A `.alog` that is a **symlink** is refused rather than followed, for the store
+  root and every fixed subdirectory. Previously `makedirs(exist_ok=True)` accepted
+  it, `chmod` followed it, and the salt-healing path could overwrite a file named
+  `salt` in someone else's directory.
+- The transcript cursor is keyed by `st_dev`/`st_ino`, not just the path, so a
+  transcript replaced at the same name no longer resumes at a stale offset.
+- The elapsed-time ceiling is re-checked after the final hash, so a one-file tree
+  can no longer overrun the budget and still return as a complete snapshot.
+
+### Redaction and classification
+
+- Quoted secret keys are masked: `{"password": "..."}` and `{"client_secret":"..."}`
+  in a prompt or command were written to the log verbatim.
+- `secret/`, `.secret/` and `.secrets/` are classified as sensitive directory
+  segments (the standalone filenames already were).
+- **Sensitive files no longer record a byte length anywhere.** `alog diff` already
+  suppressed it, but the raw size survived in the two artifacts the reader never
+  renders -- an orphaned pending Pre, and the Bash manifest's cached record *and*
+  its stat reuse key -- leaking a side channel on key type and token shape. Stored
+  as a salted digest instead; every consumer compares sizes for equality only, so
+  change detection is unaffected.
+
+### Cost estimate
+
+`MODEL_PRICING` was keyed by model **family**, which priced every modern Opus at
+the deprecated $15/$75 -- a 3x over-estimate on Opus 4.5 through Opus 5, all of
+which are $5/$25. The table is now keyed by version, transcribed from the official
+pricing page, and a model that is not listed there reports `price n/a` rather than
+borrowing a neighbour's rate.
+
+### Wiring
+
+`settings-snippet.json` uses the exec form (`"command": "python3"` plus an `args`
+array). The shell form word-split on a clone path containing spaces, which
+silently disabled **every** audit hook.
+
 ## v0.2.1 (2026-08-01)
 
 Bug-fix release. No format or CLI changes — v0.2.0 stores keep working.

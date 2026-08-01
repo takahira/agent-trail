@@ -1010,11 +1010,33 @@ def sensitive_digest(salt: bytes, content: bytes) -> str:
     return salted_digest(salt, content, sensitive=True)
 
 
-def _toolarge_rec(st, sensitive: bool) -> Dict:
+def _size_field(salt: bytes, size: int, sensitive: bool):
+    """The ``size`` to PERSIST for a record: the raw byte count normally, a salted
+    digest of it for a sensitive file.
+
+    `alog diff` already suppresses a sensitive file's size, but the raw number
+    survived in the two intermediate artifacts the reader never renders -- an
+    orphaned pending Pre and the Bash tree manifest -- so anyone who could read
+    the store learned a secret's exact byte length (a side channel on key type and
+    token shape) despite README's "sensitive files record no size".
+
+    Every consumer of this field compares it for EQUALITY only (the
+    digest-equal-but-size-different forgery tripwire, and the mtime/ctime branch
+    for unavailable files), so a digest preserves change detection exactly while
+    making the length unrecoverable without the store's 0600 salt. Same-size means
+    same digest under one salt, which is all those comparisons ask."""
+    if not sensitive:
+        return size
+    return "Z:" + hmac.new(salt, b"size:" + str(int(size)).encode("ascii"),
+                           hashlib.sha256).hexdigest()[:16]
+
+
+def _toolarge_rec(st, sensitive: bool, salt: bytes) -> Dict:
     """Record for a file too big to hash: carry size+mtime+ctime so a change is
     still detectable (a rewrite bumps ctime even if mtime is forged), and keep the
     redacted flag for a sensitive large file so it isn't shown as plain content."""
-    return {"sha": None, "size": st.st_size, "toolarge": True,
+    return {"sha": None, "size": _size_field(salt, st.st_size, sensitive),
+            "toolarge": True,
             "mtime": st.st_mtime_ns, "ctime": st.st_ctime_ns,
             "redacted": bool(sensitive)}
 
@@ -1077,7 +1099,8 @@ def snapshot_file(abs_path: str, salt: bytes, sensitive: bool) -> Optional[Dict]
                     "redacted": bool(sensitive)}
         if not stat.S_ISREG(st.st_mode):
             return _nonregular_rec(abs_path)
-        return {"sha": None, "size": st.st_size, "unreadable": True,
+        return {"sha": None, "size": _size_field(salt, st.st_size, sensitive),
+                "unreadable": True,
                 "mtime": st.st_mtime_ns, "ctime": st.st_ctime_ns,
                 "redacted": bool(sensitive)}
     try:
@@ -1086,7 +1109,7 @@ def snapshot_file(abs_path: str, salt: bytes, sensitive: bool) -> Optional[Dict]
             if not stat.S_ISREG(st.st_mode):   # FIFO/socket/device -- not content
                 return _nonregular_rec(abs_path)
             if st.st_size > MAX_HASH_BYTES:
-                return _toolarge_rec(st, sensitive)
+                return _toolarge_rec(st, sensitive, salt)
             # Read one past the cap: if the file GREW past the limit, treat it as
             # too-large rather than slurping unbounded bytes.
             content = fh.read(MAX_HASH_BYTES + 1)
@@ -1096,17 +1119,18 @@ def snapshot_file(abs_path: str, salt: bytes, sensitive: bool) -> Optional[Dict]
         # mistaken for an unchanged 'read' (both-None sha would otherwise tie).
         try:
             est = os.lstat(abs_path)
-            return {"sha": None, "size": est.st_size, "unreadable": True,
+            return {"sha": None, "size": _size_field(salt, est.st_size, sensitive),
+                    "unreadable": True,
                     "mtime": est.st_mtime_ns, "ctime": est.st_ctime_ns,
                     "redacted": bool(sensitive)}
         except OSError:
             return {"sha": None, "size": 0, "unreadable": True,
                     "redacted": bool(sensitive)}
     if len(content) > MAX_HASH_BYTES:
-        return _toolarge_rec(st, sensitive)
+        return _toolarge_rec(st, sensitive, salt)
     mode = stat.S_IMODE(st.st_mode)          # permission bits, for chmod detection
     rec = {"sha": salted_digest(salt, content, sensitive),
-           "size": len(content), "mode": mode}
+           "size": _size_field(salt, len(content), sensitive), "mode": mode}
     if sensitive:
         rec["redacted"] = True   # sensitive access -- surfaced by `alog audit`
     return rec
@@ -1358,7 +1382,15 @@ def snapshot_tree(base: str, cwd: str, salt: bytes,
             st = os.lstat(ap)
         except OSError:
             continue
-        key = [st.st_mtime_ns, st.st_ctime_ns, st.st_size]
+        cur_sensitive = path_is_sensitive(ap, disp, cwd, rcwd, rp_cache)
+        # The reuse key is only ever compared for EQUALITY, so a sensitive file's
+        # size goes in as a salted digest -- the raw byte count would otherwise sit
+        # in the manifest in cleartext (issue #8), which is the same leak the
+        # record itself was carrying and which `alog diff` deliberately suppresses.
+        # A pre-existing manifest written with a raw size simply misses the key
+        # comparison once and is re-hashed; no stale record is ever reused.
+        key = [st.st_mtime_ns, st.st_ctime_ns,
+               _size_field(salt, st.st_size, cur_sensitive)]
         cached = manifest.get(mkey)
         # RACY-CLEAN guard (git's mitigation): on a COARSE-granularity filesystem
         # (whole-second mtime/ctime -- legacy ext4 128-byte inodes, many NFS/SMB/FAT
@@ -1370,7 +1402,6 @@ def snapshot_tree(base: str, cwd: str, salt: bytes,
         # virtually never set, so the reuse cache stays fully effective.
         racy = (st.st_mtime_ns % 1_000_000_000 == 0
                 or st.st_ctime_ns % 1_000_000_000 == 0)
-        cur_sensitive = path_is_sensitive(ap, disp, cwd, rcwd, rp_cache)
         cached_rec = cached.get("rec") if isinstance(cached, dict) else None
         if (not racy and isinstance(cached, dict) and cached.get("key") == key
                 and _reusable_rec(cached_rec, cur_sensitive)):
