@@ -2387,13 +2387,50 @@ def _cursor_path(base: str, session: str) -> str:
     return os.path.join(base, "cursors", _safe_session(session) + ".json")
 
 
-def _file_identity(path: str) -> "Optional[Tuple[int, int]]":
-    """(st_dev, st_ino) for ``path``, or None if it cannot be stat'ed."""
+# Bytes of the file head fingerprinted for transcript identity. One JSONL line is
+# far shorter than this, so the window always spans content that a DIFFERENT
+# transcript would have written differently.
+CURSOR_HEAD_BYTES = 4096
+
+
+def _file_identity(path: str, head_n: "Optional[int]" = None):
+    """``(st_dev, st_ino, head_bytes_hashed, head_digest)``, or None if unreadable.
+
+    dev/ino ALONE is not identity. A filesystem is free to hand a newly created
+    file the inode a just-deleted one released, and Linux ext4/overlayfs does so
+    routinely -- CI caught exactly that: a transcript replaced at the same path
+    landed on the same dev/ino, the cursor was judged still valid, and the new
+    file's leading turns were skipped. That is precisely the bug the identity
+    check exists to prevent, so it has to survive inode reuse.
+
+    The head digest closes it: a replacement writes different leading bytes,
+    while an APPEND -- the normal case the cursor exists to optimise -- leaves
+    them untouched.
+
+    ``head_n`` is the number of leading bytes to hash, and is recorded WITH the
+    cursor rather than recomputed. Hashing "up to N bytes" instead would make the
+    digest of a file shorter than N change every time it grew, so an ordinary
+    append to a young transcript would look like a replacement and throw the
+    cursor away on every turn. On a read we re-hash exactly the byte count the
+    write used: a longer file still matches (the prefix is unchanged), a
+    truncated one does not (correctly -- it is not the same file).
+    """
+    want = CURSOR_HEAD_BYTES if head_n is None else max(0, int(head_n))
     try:
         st = os.stat(path)
+        with open(path, "rb") as fh:
+            head = fh.read(want)
     except OSError:
         return None
-    return (st.st_dev, st.st_ino)
+    if head_n is None:
+        # Recording: pin the window to what the file actually has, up to the cap.
+        want = len(head)
+    elif len(head) < want:
+        # Verifying: fewer bytes than the digest was taken over means the file
+        # shrank, so it is not the file the cursor was recorded against.
+        return None
+    return (st.st_dev, st.st_ino, want,
+            hashlib.sha256(head).hexdigest()[:16])
 
 
 def read_cursor(base: str, session: str, tpath: str) -> int:
@@ -2411,7 +2448,9 @@ def read_cursor(base: str, session: str, tpath: str) -> int:
     pathname by a different file of at least the old size resumed at the old
     offset and permanently lost every turn before it. The size clamp above only
     catches a replacement that is shorter. So the cursor also records the file's
-    dev/ino and any mismatch resets to 0.
+    dev/ino AND a digest of its first bytes -- dev/ino alone is not enough,
+    because a filesystem may reuse a freed inode for the replacement (see
+    _file_identity). Any mismatch resets to 0.
 
     dev/ino come from a stat of the path here rather than from the descriptor the
     parser later opens, so a replacement landing between the two is still
@@ -2424,8 +2463,12 @@ def read_cursor(base: str, session: str, tpath: str) -> int:
         return 0
     if not isinstance(obj, dict) or obj.get("path") != tpath:
         return 0
-    ident = _file_identity(tpath)
-    if ident is None or (obj.get("dev"), obj.get("ino")) != ident:
+    head_n = obj.get("head_n")
+    if not isinstance(head_n, int) or isinstance(head_n, bool) or head_n < 0:
+        return 0                  # legacy cursor (no head digest): re-read
+    ident = _file_identity(tpath, head_n)
+    if ident is None or (obj.get("dev"), obj.get("ino"), head_n,
+                         obj.get("head")) != ident:
         return 0
     off = obj.get("offset")
     return off if isinstance(off, int) and off >= 0 else 0
@@ -2440,7 +2483,7 @@ def write_cursor(base: str, session: str, offset: int, tpath: str) -> None:
     ident = _file_identity(tpath)
     rec = {"offset": int(offset), "path": tpath}
     if ident is not None:
-        rec["dev"], rec["ino"] = ident
+        rec["dev"], rec["ino"], rec["head_n"], rec["head"] = ident
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(json.dumps(rec))
 

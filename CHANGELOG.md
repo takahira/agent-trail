@@ -31,8 +31,13 @@ errors are no longer swallowed: an unreadable subtree is recorded as a
   root and every fixed subdirectory. Previously `makedirs(exist_ok=True)` accepted
   it, `chmod` followed it, and the salt-healing path could overwrite a file named
   `salt` in someone else's directory.
-- The transcript cursor is keyed by `st_dev`/`st_ino`, not just the path, so a
-  transcript replaced at the same name no longer resumes at a stale offset.
+- The transcript cursor is keyed by `st_dev`/`st_ino` **and a digest of the
+  file's first bytes**, not just the path, so a transcript replaced at the same
+  name no longer resumes at a stale offset. dev/ino alone was not enough: a
+  filesystem may hand the replacement the inode the old file released (Linux
+  ext4/overlayfs does so routinely), and CI caught exactly that. The hashed
+  window is recorded with the cursor rather than recomputed, so an ordinary
+  append to a short transcript does not invalidate its own cursor.
 - The elapsed-time ceiling is re-checked after the final hash, so a one-file tree
   can no longer overrun the budget and still return as a complete snapshot.
 

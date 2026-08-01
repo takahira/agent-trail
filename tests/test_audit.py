@@ -3528,12 +3528,30 @@ class TestSensitiveSizeNotPersisted(StoreTestCase):
 
     SECRET = "ANTHROPIC_API_KEY=sk-ant-notreal-000\n"     # a distinctive length
 
+    @staticmethod
+    def _contains_number(node, n):
+        """True if the parsed JSON holds `n` as an actual NUMBER, anywhere.
+
+        Parsed, not regexed. The manifest carries the length as a bare ARRAY
+        element in its reuse key, so a `"size":N` substring search walks straight
+        past it -- but a plain digit search over the raw text matches digits
+        inside a random hex digest too, which made this test pass or fail
+        depending on the salt. Walking the decoded values is exact.
+        """
+        if isinstance(node, bool):
+            return False
+        if isinstance(node, int):
+            return node == n
+        if isinstance(node, dict):
+            return any(TestSensitiveSizeNotPersisted._contains_number(v, n)
+                       for v in node.values())
+        if isinstance(node, list):
+            return any(TestSensitiveSizeNotPersisted._contains_number(v, n)
+                       for v in node)
+        return False
+
     def _raw_length_hits(self, n):
-        """Every occurrence of `n` as a standalone NUMBER anywhere in the store.
-        Scanned as a JSON number token rather than a `"size":N` substring, because
-        the manifest carries the length as a bare ARRAY element in its reuse key --
-        a field-name-anchored search walks straight past it."""
-        pat = re.compile(r"(?<![\d.])%d(?![\d.])" % n)
+        """Every store artifact holding `n` as a JSON number."""
         hits = []
         for dirpath, _dirs, files in os.walk(self.base):
             for name in files:
@@ -3542,8 +3560,17 @@ class TestSensitiveSizeNotPersisted(StoreTestCase):
                     text = pathlib.Path(path).read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError):
                     continue
-                if pat.search(text):
-                    hits.append(os.path.relpath(path, self.base))
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        node = json.loads(line)
+                    except ValueError:
+                        continue
+                    if self._contains_number(node, n):
+                        hits.append(os.path.relpath(path, self.base))
+                        break
         return hits
 
     def test_no_artifact_keeps_a_sensitive_file_byte_length(self):
@@ -3809,3 +3836,71 @@ class TestOrdinaryChangeKeepsSizes(StoreTestCase):
         out = "\n".join(alog.render_one_diff({"seq": 1, "tool": "Edit"}, rec))
         self.assertIn("5 -> 10 bytes", out)
         self.assertIn("+5", out)
+
+
+class TestCursorSurvivesInodeReuse(StoreTestCase):
+    """CI regression: dev/ino alone is not file identity.
+
+    A filesystem may hand a newly created file the inode a just-deleted one
+    released, and Linux ext4/overlayfs does so routinely -- the same-path
+    replacement test passed on macOS and failed on ubuntu for exactly that
+    reason. When the inode matches, the cursor was judged still valid and the
+    replacement transcript's leading turns were silently skipped, which is the
+    bug the identity check exists to prevent.
+
+    Inode reuse cannot be provoked reliably, so it is FORCED here: `os.stat` is
+    pinned to the pre-replacement result. Without the head digest the cursor
+    survives and the test fails on every platform.
+    """
+
+    def _write(self, path, text):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_replacement_onto_the_same_inode_still_resets(self):
+        tpath = os.path.join(self.tmp, "t.jsonl")
+        self._write(tpath, "x" * 500)
+        hook.write_cursor(self.base, "s", 400, tpath)
+        pinned = os.stat(tpath)             # capture BEFORE the replacement
+        os.remove(tpath)
+        self._write(tpath, "y" * 500)       # different file, identical length
+
+        real_stat = os.stat
+        os.stat = lambda p, *a, **kw: (
+            pinned if p == tpath else real_stat(p, *a, **kw))
+        try:
+            self.assertEqual(
+                hook.read_cursor(self.base, "s", tpath), 0,
+                "a replacement that lands on the reused inode must still reset")
+        finally:
+            os.stat = real_stat
+
+    def test_append_to_a_short_file_keeps_the_cursor(self):
+        """The window is pinned at write time, so a transcript shorter than the
+        cap does not invalidate its own cursor every time it grows -- which a
+        naive 'hash up to N bytes' would do on every single turn."""
+        tpath = os.path.join(self.tmp, "short.jsonl")
+        self._write(tpath, "x" * 10)        # far below CURSOR_HEAD_BYTES
+        hook.write_cursor(self.base, "s2", 8, tpath)
+        for _ in range(3):
+            with open(tpath, "a", encoding="utf-8") as fh:
+                fh.write("z" * 10)
+            self.assertEqual(hook.read_cursor(self.base, "s2", tpath), 8)
+
+    def test_truncation_resets_the_cursor(self):
+        tpath = os.path.join(self.tmp, "t3.jsonl")
+        self._write(tpath, "x" * 500)
+        hook.write_cursor(self.base, "s3", 400, tpath)
+        self._write(tpath, "x" * 100)
+        self.assertEqual(hook.read_cursor(self.base, "s3", tpath), 0)
+
+    def test_legacy_cursor_without_a_head_digest_resets(self):
+        """A cursor written by an older version has no head window; re-reading is
+        safe (recorded_turn_ids dedups), trusting it is not."""
+        tpath = os.path.join(self.tmp, "t4.jsonl")
+        self._write(tpath, "x" * 500)
+        st = os.stat(tpath)
+        with open(hook._cursor_path(self.base, "s4"), "w", encoding="utf-8") as fh:
+            json.dump({"offset": 400, "path": tpath,
+                       "dev": st.st_dev, "ino": st.st_ino}, fh)
+        self.assertEqual(hook.read_cursor(self.base, "s4", tpath), 0)
