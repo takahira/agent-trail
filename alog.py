@@ -41,7 +41,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 # Single source of truth for the package version (read by pyproject.toml).
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 STATUS_LETTER = {"added": "A", "modified": "M", "deleted": "D", "read": "R",
                  "present": "?", "missing": "!", "typechange": "T"}

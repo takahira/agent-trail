@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.2.1 (2026-08-01)
+
+Bug-fix release. No format or CLI changes — v0.2.0 stores keep working.
+
+### The whole-tree Bash snapshot is now bounded (#5, #7)
+
+Wired globally at a very large directory, the `Bash` whole-tree snapshot re-walked
+and re-hashed everything on **every** command, and the per-session manifest meant
+each new session paid a cold full scan. In practice this froze `Bash` outright.
+
+- Two ceilings, both configurable and both defaulting to something safe:
+  `ALOG_MAX_TREE_FILES` (20000) and `ALOG_MAX_TREE_SECONDS` (3). Set either to `0`
+  to disable it.
+- Exceeding a ceiling **skips that snapshot and says so**: a distinct
+  `tree_snapshot_skipped` event is written with the reason, files seen, elapsed
+  time and the limits in force. An audit must never render a gap as a silent
+  all-clear.
+- Per-file cost cut: `path_is_sensitive` no longer calls `os.path.realpath()` for
+  every file on every snapshot (it memoises per parent directory, revalidating
+  each hit against the parent's dev/ino fingerprint so the stale window stays
+  per-file). The walk re-checks its deadline every 64 entries; the hashing loop
+  checks on every file, because one file can cost a full `MAX_HASH_BYTES` read.
+
+Measured on the workspace that triggered the original freeze: 0.64s cold / 0.19s
+warm, ceiling hit and recorded, instead of hanging.
+
+### Redaction
+
+- Quoted DB/redis passwords are masked in recorded commands
+  (`mysql -p"..."`, `redis-cli -a '...'`).
+- Masking keeps the command name instead of swallowing it, so the log still shows
+  *what ran*.
+
+### Other
+
+- The transcript cursor resets when the file identity changes, so a rotated or
+  replaced transcript no longer resumes from a stale offset.
+- README documents `PostToolUseFailure` in the hook wiring table.
+- `.wrangler/` is git-ignored: a stray `wrangler` invocation writes a cache
+  containing a Cloudflare account id and account name into whatever directory it
+  runs from, and this is a public repo.
+
 ## v0.2.0 (2026-07-21)
 
 ### Breaking: file-content storage (the CAS) removed — digests + metadata only
