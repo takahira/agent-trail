@@ -122,8 +122,12 @@ MAX_HASH_BYTES = 10 * 1024 * 1024
 # vars; a value <= 0 disables that ceiling.
 DEFAULT_MAX_TREE_FILES = 20000       # ALOG_MAX_TREE_FILES
 DEFAULT_MAX_TREE_SECONDS = 3.0       # ALOG_MAX_TREE_SECONDS
-# During the hashing loop the deadline is re-checked every N files, so the check
-# itself stays cheap while a stall inside hashing is still caught promptly.
+# During the WALK the deadline is re-checked every N enumerated entries (on top
+# of the per-directory check), keeping a huge single directory bounded while the
+# per-entry cost stays one cheap comparison. The HASHING loop checks the deadline
+# on EVERY file instead: time.monotonic() costs tens of nanoseconds while one
+# file can cost a full MAX_HASH_BYTES read on a slow mount, so a per-chunk check
+# there let the final chunk overrun the time budget many times over.
 _TREE_DEADLINE_CHECK_EVERY = 64
 
 
@@ -657,7 +661,7 @@ def abspath_has_sensitive_dir(abs_path: str) -> bool:
     return any(seg in parts for seg in SENSITIVE_DIR_SEGMENTS_ABS)
 
 
-def _realpath_cached(ap: str, cache: Optional[Dict[str, str]]) -> str:
+def _realpath_cached(ap: str, cache: Optional[Dict[str, Tuple[str, int, int]]]) -> str:
     """``os.path.realpath(ap)`` with per-PARENT-DIRECTORY memoization.
 
     ``realpath`` walks every path component with an ``lstat``-class syscall, so
@@ -668,16 +672,45 @@ def _realpath_cached(ap: str, cache: Optional[Dict[str, str]]) -> str:
     non-symlink final component (realpath resolves the parent, then appends a
     non-link basename verbatim). A final component that IS a symlink -- or an
     odd ''/'.'/'..' basename -- falls back to the full resolution, so the
-    classification verdict never changes, only the syscall count."""
+    classification verdict never changes, only the syscall count.
+
+    Every cache HIT is revalidated against the parent's (st_dev, st_ino)
+    fingerprint taken at resolution time: a bare memo would keep serving a
+    stale resolution for the rest of the snapshot after the parent is swapped
+    (e.g. renamed away and replaced by a symlink into ~/.ssh), widening the
+    documented realpath race from per-file to per-snapshot. One ``lstat`` per
+    file still beats the path-depth walk that motivated the memo, and on a
+    mismatch (or lstat failure) the parent is re-resolved in full. The
+    fingerprint is taken BEFORE resolving, so a swap in between at worst
+    invalidates the fresh entry (a spurious re-resolve), never validates a
+    stale one. What remains is the same per-file window as the uncached path:
+    a swap between this check and the file's open is still raceable (see
+    path_is_sensitive)."""
     if cache is None:
         return os.path.realpath(ap)
     parent, name = os.path.split(ap)
     if not parent or not name or name in (".", ".."):
         return os.path.realpath(ap)
-    rparent = cache.get(parent)
-    if rparent is None:
+    entry = cache.get(parent)
+    if entry is not None:
+        try:
+            st = os.lstat(parent)
+            if (st.st_dev, st.st_ino) != (entry[1], entry[2]):
+                entry = None            # parent swapped -> re-resolve
+        except OSError:
+            entry = None                # parent gone/unreadable -> re-resolve
+    if entry is None:
+        try:
+            fp = os.lstat(parent)
+        except OSError:
+            fp = None
         rparent = os.path.realpath(parent)
-        cache[parent] = rparent
+        if fp is not None:
+            cache[parent] = (rparent, fp.st_dev, fp.st_ino)
+        else:
+            cache.pop(parent, None)     # unfingerprintable -> never serve stale
+    else:
+        rparent = entry[0]
     if os.path.islink(ap):          # rare: resolve the link itself in full
         return os.path.realpath(os.path.join(rparent, name))
     return os.path.join(rparent, name)
@@ -685,7 +718,8 @@ def _realpath_cached(ap: str, cache: Optional[Dict[str, str]]) -> str:
 
 def path_is_sensitive(ap: str, disp: str, cwd: str,
                       rcwd: Optional[str] = None,
-                      rp_cache: Optional[Dict[str, str]] = None) -> bool:
+                      rp_cache: Optional[Dict[str, Tuple[str, int, int]]] = None
+                      ) -> bool:
     """Full sensitivity classification for a snapshot: the display name/segments, an
     unambiguous ancestor dot-dir, OR -- resolving SYMLINKED ANCESTORS -- the real
     target's location. A symlinked parent (alias -> secrets/) makes the LEXICAL path
@@ -1198,9 +1232,11 @@ def snapshot_tree(base: str, cwd: str, salt: bytes,
     new_manifest: Dict[str, Dict] = {}
     # Resolve cwd ONCE and memoize ancestor realpath per parent dir (issue #7):
     # per-file realpath cost path-depth lstat x2 per file per snapshot, which
-    # dominated manifest-warm snapshots. OSError here mirrors the old per-file
-    # guard: leave rcwd unresolved and path_is_sensitive degrades the same way.
-    rp_cache: Dict[str, str] = {}
+    # dominated manifest-warm snapshots. Cache hits are fingerprint-revalidated
+    # (see _realpath_cached), so a parent swapped mid-snapshot is re-resolved.
+    # OSError here mirrors the old per-file guard: leave rcwd unresolved and
+    # path_is_sensitive degrades the same way.
+    rp_cache: Dict[str, Tuple[str, int, int]] = {}
     try:
         rcwd: Optional[str] = os.path.realpath(cwd)
     except OSError:
@@ -1209,9 +1245,10 @@ def snapshot_tree(base: str, cwd: str, salt: bytes,
     for ap in walk_worktree(cwd, base, max_files=max_files or None,
                             deadline=deadline):
         processed += 1
-        if (deadline is not None
-                and processed % _TREE_DEADLINE_CHECK_EVERY == 0
-                and time.monotonic() > deadline):
+        # Check the deadline EVERY file: a per-chunk (modulo) check let the
+        # final chunk -- or a whole tree smaller than the chunk -- overrun the
+        # time budget by up to chunk-size MAX_HASH_BYTES reads on a slow mount.
+        if deadline is not None and time.monotonic() > deadline:
             raise TreeCeilingExceeded("time_budget", processed,
                                       time.monotonic() - start)
         disp = rel_to_cwd(cwd, ap)

@@ -2969,6 +2969,35 @@ class TestWalkCeiling(CeilingTestCase):
             hook.snapshot_tree(self.base, self.work, self.salt, "s-time")
         self.assertEqual(ctx.exception.reason, "time_budget")
 
+    def test_hashing_loop_checks_deadline_every_file(self):
+        # Codex follow-up to #5: the hashing loop must check the time budget on
+        # EVERY file. The old every-64 modulo check let the final (or only)
+        # chunk of <=63 files overrun ALOG_MAX_TREE_SECONDS -- worst case 63 x
+        # MAX_HASH_BYTES reads on a slow mount. Simulate the slow mount with a
+        # fake monotonic clock advancing 1s per call: on this 5-file tree the
+        # per-chunk check never fired at all, so the snapshot completed instead
+        # of raising.
+        for i in range(5):
+            self.wf("slow{0}.txt".format(i), b"x")
+        os.environ["ALOG_MAX_TREE_SECONDS"] = "3"
+        ticks = {"now": 0.0}
+
+        def fake_monotonic():
+            ticks["now"] += 1.0
+            return ticks["now"]
+
+        real_monotonic = time.monotonic
+        hook.time.monotonic = fake_monotonic
+        try:
+            with self.assertRaises(hook.TreeCeilingExceeded) as ctx:
+                hook.snapshot_tree(self.base, self.work, self.salt, "s-perfile")
+        finally:
+            hook.time.monotonic = real_monotonic
+        self.assertEqual(ctx.exception.reason, "time_budget")
+        # The overrun was caught inside the hashing loop, well before the old
+        # 64-file granularity would ever have looked at the clock.
+        self.assertLessEqual(ctx.exception.files_seen, 5)
+
     def test_zero_disables_ceilings(self):
         for i in range(12):
             self.wf("z{0}.txt".format(i), b"x")
@@ -3106,6 +3135,53 @@ class TestRealpathMemo(StoreTestCase):
         # linkfile cases are only catchable through realpath resolution.
         self.assertEqual(verdicts, [False, False, True, True, True, True])
         self.assertTrue(cache)                     # the memo was actually used
+
+    def test_cache_hit_detects_parent_swap(self):
+        # Codex follow-up to #7: a bare per-parent memo kept serving a stale
+        # resolution for the rest of the snapshot after the parent was swapped,
+        # widening the documented realpath race from per-file to per-snapshot.
+        # Every cache hit must revalidate the parent's (st_dev, st_ino)
+        # fingerprint: resolve one file under a real dir (populating the memo),
+        # rename the dir away and plant a symlink to another dir at the same
+        # lexical path, then resolve a second file under that path -- the
+        # second resolution must reflect the NEW target.
+        box = os.path.join(self.work, "box")
+        self.wf("box/first.txt", b"a")
+        target = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(target)
+        with open(os.path.join(target, "second.txt"), "wb") as fh:
+            fh.write(b"b")
+        cache = {}
+        first = hook._realpath_cached(os.path.join(box, "first.txt"), cache)
+        self.assertEqual(first,
+                         os.path.join(os.path.realpath(box), "first.txt"))
+        self.assertTrue(cache)                     # the memo was populated
+        os.rename(box, box + ".moved")             # swap: real dir -> symlink
+        os.symlink(target, box)
+        second = hook._realpath_cached(os.path.join(box, "second.txt"), cache)
+        self.assertEqual(second,
+                         os.path.join(os.path.realpath(target), "second.txt"))
+
+    def test_parent_swap_to_sensitive_dir_reclassifies(self):
+        # The security consequence of the stale memo: a parent swapped to a
+        # symlink into ~/.ssh mid-snapshot must flag subsequent files under it
+        # as sensitive, not inherit the pre-swap verdict through the cache.
+        real_ssh = os.path.join(self.tmp, "realhome", ".ssh")
+        os.makedirs(real_ssh)
+        with open(os.path.join(real_ssh, "config"), "w") as fh:
+            fh.write("Host x\n")
+        box = os.path.join(self.work, "box")
+        self.wf("box/plain.txt", b"a")
+        rcwd = os.path.realpath(self.work)
+        cache = {}
+        self.assertFalse(hook.path_is_sensitive(
+            os.path.join(box, "plain.txt"), "box/plain.txt", self.work,
+            rcwd, cache))
+        os.rename(box, box + ".moved")
+        os.symlink(real_ssh, box)
+        self.assertTrue(hook.path_is_sensitive(
+            os.path.join(box, "config"), "box/config", self.work,
+            rcwd, cache))
 
     def test_snapshot_tree_flags_symlinked_parent_secret(self):
         # End-to-end guard: snapshot_tree (which passes the memo) still flags a

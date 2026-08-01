@@ -240,6 +240,15 @@ Honest scope — this records a lot, but not everything:
   a secret in an unusually-named file is still recorded as an access, just not
   flagged sensitive. (Nothing is at risk at rest either way — contents are never
   stored.)
+- **Symlinked-ancestor classification is best-effort under concurrent renames.**
+  A file whose parent directory is a symlink into a sensitive location is
+  caught by resolving the path (`realpath`). Whole-tree snapshots memoize that
+  resolution per parent directory and revalidate every reuse against the
+  parent's device/inode fingerprint, so a directory swapped mid-snapshot is
+  re-resolved at the next file under it — the stale window is per-file, not
+  per-snapshot. A swap that lands between that check and the file's open
+  remains theoretically raceable (classic TOCTOU), the same window as
+  resolving without the cache.
 - **Prompt redaction is best-effort.** It masks known secret *shapes*; a secret
   with no recognizable shape in free text can slip through — an effort, not a
   guarantee.
