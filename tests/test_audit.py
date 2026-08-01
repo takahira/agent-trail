@@ -2917,8 +2917,16 @@ class TestFinalClaudeReviewFixes(unittest.TestCase):
 
             t = threading.Thread(target=run, daemon=True)
             t.start()
-            self.assertTrue(t.join(2.0) or not t.is_alive(),
-                            "get_salt blocked on a FIFO-swapped salt file")
+            # The claim is that get_salt RETURNS -- a blocking open on a
+            # writer-less FIFO hangs forever, so any finite budget distinguishes
+            # the two. The budget is deliberately generous rather than tight:
+            # get_salt's own heal-retry loop is 100 rounds with a 5ms sleep each,
+            # i.e. at least 0.5s of sleeping plus 100 exists/open/read rounds
+            # before it can give up. A 2s budget left almost no headroom for that
+            # on a contended runner, and this test flaked on macOS CI accordingly.
+            # (`Thread.join()` returns None, so the old `join(2.0) or ...` was
+            # just the is_alive check written twice.)
+            t.join(30.0)
             self.assertFalse(t.is_alive(),
                              "get_salt blocked on a FIFO-swapped salt file")
             self.assertEqual(len(result.get("salt", b"")), 16)
