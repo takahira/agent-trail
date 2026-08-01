@@ -213,7 +213,11 @@ SENSITIVE_GLOBS = [
 #        CLONED under ~/projects/secrets/ or ~/code/gcloud/ must NOT have every file
 #        wholesale-flagged (which would drown `alog audit` in false positives).
 SENSITIVE_DIR_SEGMENTS_ABS = {".ssh", ".aws", ".gnupg", ".kube", ".docker"}
-SENSITIVE_DIR_SEGMENTS_REL = {"gcloud", "secrets"}
+# `secret` / `.secret` / `.secrets` are as common as `secrets` in real trees and
+# were classified NON-sensitive, so `audit --fail-on-hit` could exit 0 over a read
+# of `.secrets/token.txt`. The bare names were already in SENSITIVE_EXACT_NAMES;
+# only the directory segments were missing.
+SENSITIVE_DIR_SEGMENTS_REL = {"gcloud", "secrets", "secret", ".secret", ".secrets"}
 SENSITIVE_PATH_SEGMENTS = SENSITIVE_DIR_SEGMENTS_ABS | SENSITIVE_DIR_SEGMENTS_REL
 # Allowlist, checked FIRST: public / template artifacts are NEVER secret, so
 # they don't pollute `alog audit` with false "secret access" lines. Without it,
@@ -264,6 +268,17 @@ KV_SECRET_RE = re.compile(
     r"pgpass(?:word)?|session[_-]?token|token|auth|access[_-]?key|"
     r"client[_-]?secret|private[_-]?key)[\w-]{0,40}\s*[=:]\s*)"
     r"(\"[^\"]*\"|'[^']*'|[^\s;|&]+)")
+# The same names inside a QUOTED key -- JSON and YAML, i.e. most of what a prompt
+# or a `curl -d` body actually looks like. KV_SECRET_RE cannot see these: the
+# closing quote sits between the name and the ':', so `{"password": "swordfish"}`
+# went into the NDJSON log verbatim. Group 1 keeps the quoted key and delimiter,
+# group 2 is the value (quoted value swallowed whole, as above). Same bounded
+# {0,40} runs for the same ReDoS reason.
+QUOTED_KEY_SECRET_RE = re.compile(
+    r"(?i)([\"'][\w-]{0,40}(?:api[_-]?key|secret|passw(?:or)?d|passphrase|pwd|"
+    r"pgpass(?:word)?|session[_-]?token|token|auth|access[_-]?key|"
+    r"client[_-]?secret|private[_-]?key)[\w-]{0,40}[\"']\s*[=:]\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s,;|&}\]]+)")
 # user:pass@host embedded in a URL (group 2 = password, masked). The user part is
 # OPTIONAL so redis://:pass@host (empty user) is still caught. The scheme run is
 # BOUNDED ({0,15}); an unbounded [a-z0-9+.\-]* before '://' backtracks
@@ -443,7 +458,6 @@ CMD_SPLIT_RE = re.compile(r"[\s;|&><()\"'`]+")
 def log_internal(msg: str) -> None:
     if os.environ.get("ALOG_DEBUG"):
         sys.stderr.write("alog-hook: {0}\n".format(msg))
-
 
 def data_dir(cwd: str) -> str:
     return os.environ.get("ALOG_DATA") or os.path.join(cwd, ".alog")
@@ -828,6 +842,11 @@ def _apply_secret_subs(text: str, prose: bool = False) -> str:
     out = DB_P_PASS_RE.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", out)
     out = REDIS_A_PASS_RE.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", out)
     out = CURL_USERPASS_RE.sub(lambda m: m.group(1) + "<redacted>", out)
+    # Quoted keys BEFORE the bare-key rule: the bare rule cannot match them (its
+    # name run stops at the closing quote), and running it first would leave the
+    # quoted form untouched. Same _kv_sub, so a quoted low-confidence key in prose
+    # is judged by the same "does the value look secretish" test.
+    out = QUOTED_KEY_SECRET_RE.sub(lambda m: _kv_sub(m, prose), out)
     out = KV_SECRET_RE.sub(lambda m: _kv_sub(m, prose), out)
     out = URL_CRED_RE.sub(lambda m: m.group(1) + "<redacted>" + m.group(3), out)
     out = FLAG_SECRET_RE.sub(lambda m: m.group(1) + "<redacted>", out)

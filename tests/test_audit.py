@@ -3313,3 +3313,55 @@ class TestWalkErrorIsAGap(CeilingTestCase):
         self.assertIn("linkdir", names, "a symlinked dir must be recorded")
         self.assertNotIn(os.path.join("linkdir", "a.txt"), names,
                          "a symlinked dir must not be descended")
+
+
+
+class TestQuotedKeyRedaction(unittest.TestCase):
+    """#8: JSON/YAML quoted keys bypassed redaction, so `{"password": "x"}` in a
+    prompt or a curl body went into the NDJSON log verbatim. The bare-key rule
+    cannot see them -- the closing quote sits between the name and the ':'."""
+
+    def _assert_masked(self, text, secret, prose=False):
+        out = hook._apply_secret_subs(text, prose)
+        self.assertNotIn(secret, out, "secret survived redaction: " + out)
+        self.assertIn("<redacted>", out)
+
+    def test_json_quoted_keys(self):
+        # Short dictionary words on purpose: a token-SHAPE rule must not be what
+        # makes this pass, or the test would not be testing the key rule.
+        self._assert_masked('{"password": "swordfish"}', "swordfish")
+        self._assert_masked('{"client_secret":"hunter2"}', "hunter2")
+        self._assert_masked('{"api_key": "orange"}', "orange")
+
+    def test_single_quoted_yaml_style_key(self):
+        self._assert_masked("'token': 'banana'", "banana")
+
+    def test_inside_a_command_body(self):
+        self._assert_masked('curl -d \'{"api_key": "melon"}\' https://x.test', "melon")
+
+    def test_high_confidence_key_masks_even_in_prose(self):
+        self._assert_masked('パスワードは {"password": "swordfish"} です',
+                            "swordfish", prose=True)
+
+    def test_ordinary_prose_survives(self):
+        # The narrowing must not start eating normal text.
+        out = hook._apply_secret_subs('{"auth": "yes"}', True)
+        self.assertEqual(out, '{"auth": "yes"}')
+
+
+class TestSecretDirectorySegments(unittest.TestCase):
+    """#8: `.secrets/` `.secret/` `secret/` were classified NON-sensitive, so
+    `audit --fail-on-hit` could exit 0 over a read of `.secrets/token.txt`."""
+
+    def _sens(self, rel):
+        cwd = "/tmp/w"
+        return hook.path_is_sensitive(os.path.join(cwd, rel), rel, cwd)
+
+    def test_secret_directory_variants_are_sensitive(self):
+        for rel in (".secrets/token.txt", ".secret/token.txt",
+                    "secret/token.txt", "secrets/token.txt"):
+            self.assertTrue(self._sens(rel), rel)
+
+    def test_words_merely_starting_with_secret_are_not(self):
+        for rel in ("docs/secretary.md", "notes/secretariat.txt", "src/main.py"):
+            self.assertFalse(self._sens(rel), rel)
