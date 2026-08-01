@@ -14,3 +14,8 @@ build/
 .env
 .env.*
 .alog/
+# Wrangler writes a local cache (Cloudflare account id + account name, which is an
+# email address) into any directory it is run from. This project has nothing to do
+# with Cloudflare, but a stray `npx wrangler ...` in this cwd would otherwise leave
+# that cache untracked and one `git add -A` away from being published.
+.wrangler/
