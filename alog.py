@@ -468,10 +468,21 @@ def cmd_sessions(base: str) -> int:
     return 0
 
 
+def _status(c: Dict) -> str:
+    """A change's status as a STRING, for dict lookups and comparisons.
+
+    A tampered log can carry `"status": {}` or `[]`, and an unhashable value raises
+    TypeError inside `STATUS_LETTER.get(...)` -- which aborted the entire command,
+    including `audit --fail-on-hit`, over one crafted line. Coercing here means a
+    junk status renders as unknown ("?") and the rest of the audit still runs."""
+    v = c.get("status")
+    return v if isinstance(v, str) else ""
+
+
 def _change_line(ev: Dict, c: Dict, tool: str) -> Optional[str]:
     """The `alog show` line for one change, or None to skip it (an incidental
     whole-tree read seen under a Bash scan is not the agent's deliberate access)."""
-    status = c.get("status")
+    status = _status(c)
     letter = STATUS_LETTER.get(status, "?")
     sflag = "  ⚠ sensitive" if is_agent_sensitive(ev, c) else ""
     anote = attribution_note(ev, c)
@@ -496,8 +507,12 @@ def _change_line(ev: Dict, c: Dict, tool: str) -> Optional[str]:
         if b_sz is None and a_sz is None:
             lc = "  (large; content not hashed)"
         else:
+            # Render the GUARDED ints, never the raw fields: a tampered log can put
+            # any JSON value in before_size/after_size, and stringifying it here
+            # bypassed the `_size_int` guard the rest of the renderer applies.
             lc = "  (large; {0}->{1} bytes, content not hashed)".format(
-                _safe_inline(str(c.get("before_size"))), _safe_inline(str(c.get("after_size"))))
+                "?" if b_sz is None else "{0:,}".format(b_sz),
+                "?" if a_sz is None else "{0:,}".format(a_sz))
     elif status != "typechange" and c.get("content_unavailable") == "unreadable":
         lc = "  (unreadable at snapshot; content not captured)"
     mc = ""
@@ -572,7 +587,7 @@ def render_one_diff(ev: Dict, change: Dict) -> List[str]:
     what this view adds is changes by opaque Bash commands, untracked/ignored
     files, and sensitive accesses."""
     path = _safe_inline(change.get("path"))  # sanitized once; used in every header below
-    status = change.get("status")
+    status = _status(change)
     out = ["diff --alog [#{0:02d} {1}] {2}".format(
         _seq(ev), _safe_inline(ev.get("tool") or "?"), path)]
 
@@ -587,18 +602,32 @@ def render_one_diff(ev: Dict, change: Dict) -> List[str]:
             or str(change.get("before") or "").startswith("S:") \
             or str(change.get("after") or "").startswith("S:"):
         verb = {"added": "created", "modified": "modified",
-                "deleted": "deleted"}.get(status if isinstance(status, str) else None,
-                                          "touched")
+                "deleted": "deleted"}.get(status, "touched")
         out.append("[sensitive -- content not stored; {0}, access recorded]".format(verb))
         return out
     if status == "typechange":
         out.append("type change (regular file <-> directory/special): {0}".format(path))
         return out
+    # A non-regular path has no content and a hardcoded size 0, so the byte-delta
+    # branches below rendered a symlink REPOINT (`ln -sf /etc/shadow link`) as
+    # `modified: link  (0 -> 0 bytes, +0)` -- the security-relevant case reading
+    # like a no-op edit. Say what it is and suppress the meaningless byte clause.
+    if change.get("kind") == "non-regular":
+        if change.get("link_changed"):
+            out.append("symlink retargeted (content not stored): {0}".format(path))
+        else:
+            verb = {"added": "created", "deleted": "deleted"}.get(status, "changed")
+            out.append("non-regular path ({0}; symlink/fifo/socket/device): {1}".format(
+                verb, path))
+        return out
     cu = change.get("content_unavailable")
     if change.get("large") or cu == "large":
+        b_lg = _size_int(change.get("before_size"))
+        a_lg = _size_int(change.get("after_size"))
         out.append("large file (>{0} bytes, content not hashed): size {1} -> {2}".format(
-            10 * 1024 * 1024, _safe_inline(str(change.get("before_size"))),
-            _safe_inline(str(change.get("after_size")))))
+            10 * 1024 * 1024,
+            "?" if b_lg is None else "{0:,}".format(b_lg),
+            "?" if a_lg is None else "{0:,}".format(a_lg)))
         return out
     if cu == "unreadable":
         out.append("unreadable at snapshot time (change detected via stat): {0}".format(path))
@@ -626,6 +655,19 @@ def render_one_diff(ev: Dict, change: Dict) -> List[str]:
             and all(isinstance(m, int) and not isinstance(m, bool) for m in mc):
         out.append("mode: {0:o} -> {1:o}".format(mc[0], mc[1]))
     return out
+
+
+def legacy_object_store(base: str) -> bool:
+    """True if this store still has the v0.1 `objects/` content-addressed store.
+
+    v0.2 stopped writing file bytes but does not delete an existing `objects/`, so
+    a store upgraded in place still holds the old content on disk. Any claim that
+    "content is never stored" is false for such a store and must say so instead."""
+    try:
+        return os.path.isdir(os.path.join(base, "objects")) \
+            and bool(os.listdir(os.path.join(base, "objects")))
+    except OSError:
+        return False
 
 
 GAP_KINDS = ("tree_snapshot_skipped", "events_dropped")
@@ -671,7 +713,16 @@ def cmd_diff(base: str, session: Optional[str], only_path: Optional[str]) -> int
               + (" (but see the gap(s) above -- absence here is NOT proof of none)"
                  if gaps else ""))
     else:
-        print("note: file content is never stored (salted digests + metadata only);")
+        # T2-2: the note is a claim about THIS store, so check it before printing.
+        # A v0.1 store kept file bytes in `objects/`; v0.2 stopped writing there but
+        # never deletes an existing one, so reading a pre-upgrade store printed
+        # "content is never stored" over a directory that still holds the content.
+        if legacy_object_store(base):
+            print("WARNING: this store has a legacy v0.1 `objects/` directory, which")
+            print("         HOLDS FILE CONTENT. v0.2+ never writes there, but the old")
+            print("         bytes remain until you delete it. Treat it as sensitive.")
+        else:
+            print("note: file content is never stored (salted digests + metadata only);")
         print("      for tracked files, `git diff` / `git log -p` has the content story.")
     return 0
 
@@ -708,7 +759,7 @@ def cmd_audit(base: str, session: Optional[str], show_time: bool,
             sens_paths.add(c.get("path"))
             verb = {"read": "READ", "added": "WROTE", "modified": "MODIFIED",
                     "deleted": "DELETED", "missing": "READ-ATTEMPT (absent)",
-                    "present": "ACCESSED"}.get(c.get("status"), "TOUCHED")
+                    "present": "ACCESSED"}.get(_status(c), "TOUCHED")
             print("  [#{0:02d}] {1}{2}{3} {4} {5}".format(
                 seq or 0, t, st, tool.lower(), verb, _safe_inline(c.get("path"))))
         for marker in _markers(ev):

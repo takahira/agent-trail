@@ -844,9 +844,23 @@ class TestRenderDiff(StoreTestCase):
             {"path": "big.bin", "status": "modified", "large": True,
              "content_unavailable": "large", "before_size": 11_000_000,
              "after_size": 12_000_000, "before": "D:a", "after": "D:b"}, "edit")
-        self.assertIn("11000000", line)
-        self.assertIn("12000000", line)
+        # Thousands-separated, matching every other size the renderer prints.
+        self.assertIn("11,000,000", line)
+        self.assertIn("12,000,000", line)
         self.assertIn("bytes", line)
+
+    def test_show_large_with_tampered_size_does_not_print_raw_junk(self):
+        """T2-4: the large-file notice stringified before_size/after_size directly,
+        bypassing the `_size_int` guard the rest of the renderer applies, so a
+        tampered log's arbitrary JSON landed in the output."""
+        line = alog._change_line(
+            {"tool": "Edit"},
+            {"path": "big.bin", "status": "modified", "large": True,
+             "content_unavailable": "large", "before_size": {"evil": 1},
+             "after_size": 12_000_000, "before": "D:a", "after": "D:b"}, "edit")
+        self.assertNotIn("evil", line)
+        self.assertIn("?", line)
+        self.assertIn("12,000,000", line)
 
 
 class TestArgparseSessionFilter(StoreTestCase):
@@ -3579,3 +3593,219 @@ class TestSensitiveSizeNotPersisted(StoreTestCase):
         self.assertTrue(rec["sensitive"])
         self.assertNotIn("before_size", rec)
         self.assertNotIn("after_size", rec)
+
+
+class TestTamperedStatusDoesNotAbort(StoreTestCase):
+    """T2-1: a crafted event with an UNHASHABLE status (`{}` / `[]`) raised
+    TypeError inside `STATUS_LETTER.get(...)`, aborting the whole command --
+    including `audit --fail-on-hit`, whose non-zero exit is what CI keys on. One
+    junk line must never take the audit down with it."""
+
+    def _write(self, session, change):
+        hook._append_event(self.base, session,
+                           {"seq": 1, "tool": "Edit", "changes": [change]})
+
+    def _run(self, fn, *args):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = fn(*args)
+        return rc, buf.getvalue()
+
+    def test_unhashable_status_renders_as_unknown_in_show(self):
+        self._write("s1", {"path": "a.txt", "status": {}, "sensitive": False})
+        rc, out = self._run(alog.cmd_show, self.base, "s1", False)
+        self.assertEqual(rc, 0)
+        self.assertIn("a.txt", out)
+
+    def test_unhashable_status_does_not_abort_audit(self):
+        self._write("s2", {"path": ".env", "status": [], "sensitive": True})
+        rc, out = self._run(alog.cmd_audit, self.base, "s2", False, True)
+        # The sensitive access must still be reported, and --fail-on-hit still exit 2.
+        self.assertEqual(rc, 2)
+        self.assertIn(".env", out)
+
+    def test_unhashable_status_does_not_abort_diff(self):
+        self._write("s3", {"path": "a.txt", "status": {}, "before": "D:1",
+                           "after": "D:2"})
+        rc, _out = self._run(alog.cmd_diff, self.base, "s3", None)
+        self.assertEqual(rc, 0)
+
+
+class TestSymlinkRetargetRendering(StoreTestCase):
+    """T2-3: a non-regular record carries a hardcoded size 0, so a symlink REPOINT
+    (`ln -sf /etc/shadow link`) rendered as `modified: link (0 -> 0 bytes, +0)` --
+    the security-relevant case reading like a no-op edit."""
+
+    def test_retarget_is_named_not_shown_as_a_zero_byte_edit(self):
+        link = os.path.join(self.work, "link")
+        target_a = os.path.join(self.work, "a.txt")
+        target_b = os.path.join(self.work, "b.txt")
+        for t in (target_a, target_b):
+            with open(t, "w", encoding="utf-8") as fh:
+                fh.write("x")
+        os.symlink(target_a, link)
+        before = {"link": hook.snapshot_file(link, self.salt, False)}
+        os.remove(link)
+        os.symlink(target_b, link)
+        after = {"link": hook.snapshot_file(link, self.salt, False)}
+
+        changes = hook.build_changes(before, after, True, None)
+        self.assertEqual(len(changes), 1)
+        rec = changes[0]
+        self.assertEqual(rec["status"], "modified")      # the repoint IS a change
+        self.assertEqual(rec.get("kind"), "non-regular")
+        self.assertTrue(rec.get("link_changed"))
+
+        out = "\n".join(alog.render_one_diff({"seq": 1, "tool": "Bash"}, rec))
+        self.assertIn("symlink retargeted", out)
+        self.assertNotIn("0 -> 0 bytes", out)
+
+    def test_unchanged_symlink_is_not_called_a_retarget(self):
+        link = os.path.join(self.work, "link")
+        target = os.path.join(self.work, "a.txt")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        os.symlink(target, link)
+        rec = hook.snapshot_file(link, self.salt, False)
+        changes = hook.build_changes({"link": rec}, {"link": rec}, True, None)
+        self.assertEqual(changes[0]["status"], "read")
+        self.assertFalse(changes[0].get("link_changed"))
+
+
+class TestLegacyObjectStoreWarning(StoreTestCase):
+    """T2-2: `alog diff` printed "file content is never stored" even against a v0.1
+    store whose `objects/` directory still holds the bytes. v0.2 stopped writing
+    there but never deletes it, so the claim was false for any upgraded store."""
+
+    def _diff(self, session):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            alog.cmd_diff(self.base, session, None)
+        return buf.getvalue()
+
+    def _one_change(self, session):
+        hook._append_event(self.base, session,
+                           {"seq": 1, "tool": "Edit",
+                            "changes": [{"path": "a.txt", "status": "modified",
+                                         "before": "D:1", "after": "D:2"}]})
+
+    def test_clean_store_keeps_the_never_stored_note(self):
+        self._one_change("s1")
+        self.assertIn("never stored", self._diff("s1"))
+        self.assertFalse(alog.legacy_object_store(self.base))
+
+    def test_legacy_objects_dir_replaces_the_note_with_a_warning(self):
+        objects = os.path.join(self.base, "objects")
+        os.makedirs(objects)
+        with open(os.path.join(objects, "ab12"), "w", encoding="utf-8") as fh:
+            fh.write("stored file content from v0.1")
+        self._one_change("s2")
+        out = self._diff("s2")
+        self.assertTrue(alog.legacy_object_store(self.base))
+        self.assertIn("HOLDS FILE CONTENT", out)
+        self.assertNotIn("content is never stored", out)
+
+    def test_empty_objects_dir_is_not_flagged(self):
+        """An emptied-out legacy dir holds nothing; don't cry wolf."""
+        os.makedirs(os.path.join(self.base, "objects"))
+        self._one_change("s3")
+        self.assertFalse(alog.legacy_object_store(self.base))
+        self.assertIn("never stored", self._diff("s3"))
+
+
+class TestLegacyPlainHexEventRenders(StoreTestCase):
+    """T3-1: backward readability of a v0.1 event (plain unsalted 64-hex digests,
+    no `D:`/`S:` prefix) is promised but was never tested."""
+
+    def test_v01_event_renders_without_crashing(self):
+        b, a = "a" * 64, "b" * 64
+        hook._append_event(self.base, "s1",
+                           {"seq": 1, "tool": "Edit",
+                            "changes": [{"path": "old.txt", "status": "modified",
+                                         "before": b, "after": a,
+                                         "before_size": 10, "after_size": 12}]})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(alog.cmd_diff(self.base, "s1", None), 0)
+            self.assertEqual(alog.cmd_show(self.base, "s1", False), 0)
+        out = buf.getvalue()
+        self.assertIn("old.txt", out)
+        self.assertIn("10", out)          # sizes still render for a legacy record
+        self.assertIn("12", out)
+
+    def test_v01_plain_hex_is_not_mistaken_for_a_sensitive_digest(self):
+        """Only an `S:` prefix marks sensitive; a plain 64-hex digest must not
+        trip the sensitive branch and hide an ordinary file's diff."""
+        rec = {"path": "old.txt", "status": "modified",
+               "before": "s" * 64, "after": "b" * 64,
+               "before_size": 10, "after_size": 12}
+        out = "\n".join(alog.render_one_diff({"seq": 1, "tool": "Edit"}, rec))
+        self.assertNotIn("sensitive", out)
+        self.assertIn("modified", out)
+
+
+class TestSlackTokenRedaction(unittest.TestCase):
+    """T3-2: `xapp-` / `xoxe-` masking in redact_command is live behaviour that
+    lost its only test when the sniff tests were deleted."""
+
+    # DELIBERATELY SHORT fixtures. A realistic-length Slack token here is matched
+    # by GitHub's secret scanner and Push Protection rejects the push -- a dummy
+    # of the real SHAPE is still a "secret" to the scanner. These keep the prefix
+    # and separator structure the redaction regexes key on, and nothing more.
+    SHAPES = ("xoxb-1-2-abcd", "xoxp-1-2-abcd", "xoxa-1-2-abcd",
+              "xoxe-1-abcdefgh", "xapp-1-A1-2-abcdefgh")
+
+    def test_slack_token_shapes_are_masked(self):
+        for token in self.SHAPES:
+            out = hook.redact_command(
+                "curl -H 'Authorization: Bearer " + token + "'")
+            self.assertNotIn(token, out, token)
+
+    def test_the_fixtures_would_survive_an_unredacted_path(self):
+        """Guard against the fixtures being so short they stop matching: if a
+        shape ever falls out of the regex, this test must fail rather than the
+        masking test passing because there was nothing to mask."""
+        for token in self.SHAPES:
+            self.assertNotEqual(hook.redact_command("x " + token), "x " + token,
+                                token)
+
+    def test_masking_keeps_the_command_name(self):
+        out = hook.redact_command("curl -d token=xoxb-1-2-abcd")
+        self.assertTrue(out.startswith("curl"), out)
+
+
+class TestOrdinaryChangeKeepsSizes(StoreTestCase):
+    """T3-3: the size fields on ordinary added/modified/deleted changes had no unit
+    test -- only the sensitive-omission path did, so a regression that dropped
+    sizes everywhere would have gone unnoticed."""
+
+    def _rec(self, path, text):
+        p = os.path.join(self.work, path)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return hook.snapshot_file(p, self.salt, False)
+
+    def test_added_modified_deleted_all_carry_sizes(self):
+        before = {"a.txt": self._rec("a.txt", "12345"),
+                  "gone.txt": self._rec("gone.txt", "xyz")}
+        after = {"a.txt": self._rec("a.txt", "1234567890"),
+                 "new.txt": self._rec("new.txt", "hi")}
+        by_path = {c["path"]: c for c in
+                   hook.build_changes(before, after, True, None)}
+
+        self.assertEqual(by_path["a.txt"]["status"], "modified")
+        self.assertEqual(by_path["a.txt"]["before_size"], 5)
+        self.assertEqual(by_path["a.txt"]["after_size"], 10)
+
+        self.assertEqual(by_path["new.txt"]["status"], "added")
+        self.assertEqual(by_path["new.txt"]["after_size"], 2)
+
+        self.assertEqual(by_path["gone.txt"]["status"], "deleted")
+        self.assertEqual(by_path["gone.txt"]["before_size"], 3)
+
+    def test_renderer_shows_the_byte_delta(self):
+        rec = {"path": "a.txt", "status": "modified", "before": "D:1",
+               "after": "D:2", "before_size": 5, "after_size": 10}
+        out = "\n".join(alog.render_one_diff({"seq": 1, "tool": "Edit"}, rec))
+        self.assertIn("5 -> 10 bytes", out)
+        self.assertIn("+5", out)

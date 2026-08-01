@@ -57,6 +57,32 @@ which are $5/$25. The table is now keyed by version, transcribed from the offici
 pricing page, and a model that is not listed there reports `price n/a` rather than
 borrowing a neighbour's rate.
 
+### Reader robustness (#3 Tier 2)
+
+- A tampered event with an **unhashable** `status` (`{}` / `[]`) raised TypeError
+  inside a dict lookup and aborted the whole command -- including
+  `audit --fail-on-hit`, whose exit code is what CI keys on. Status is coerced to
+  a string, so one junk line renders as unknown and the audit still runs.
+- `alog diff` no longer claims "file content is never stored" when reading a
+  **legacy v0.1 store**: v0.2 stopped writing `objects/` but never deletes an
+  existing one, so an upgraded store still holds the bytes. It now warns instead.
+- A **symlink retarget** (`ln -sf /etc/shadow link`) rendered as
+  `modified: link (0 -> 0 bytes, +0)`, because a non-regular record carries a
+  hardcoded size 0. Change records now carry `kind`/`link_changed` and the reader
+  names the repoint.
+- The large-file notice stringified `before_size`/`after_size` directly, bypassing
+  the tampered-log guard the rest of the renderer applies.
+
+### Tests and demo (#3 Tier 3)
+
+- New coverage for gaps that were promised but untested: rendering a v0.1
+  plain-hex event, Slack `xoxb`/`xoxp`/`xapp`/`xoxe` redaction, and the size
+  fields on ordinary added/modified/deleted changes.
+- Three demo assertions were vacuous and are now anchored to what they claim:
+  `S4` matched a bare `"bytes"` (present in any multi-file diff), the binary-file
+  check only asserted the created line and never looked for the bytes, and
+  `G4`'s `-line1` refutation could never fire since v0.2 emits no content hunks.
+
 ### Wiring
 
 `settings-snippet.json` uses the exec form (`"command": "python3"` plus an `args`

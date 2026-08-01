@@ -180,8 +180,9 @@ class TreeCeilingExceeded(Exception):
 
 # Sensitive-file matching. Bias: PRECISE (few false positives) over exhaustive.
 # Detection here is non-blocking -- a missed file is still logged as an access
-# when read via the Read tool; the point is the secret-content-at-rest guard and
-# the "read of a secret" headline, not a perfect classifier.
+# when read via the Read tool. Since v0.2 no file content is stored at all, so
+# classification no longer guards secret bytes at rest; what it drives is the
+# "read of a secret" headline, the `S:` digest prefix, and size suppression.
 SENSITIVE_EXACT_NAMES = {
     "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
     "credentials", ".npmrc", ".netrc", ".pgpass", ".htpasswd",
@@ -1973,6 +1974,17 @@ def build_changes(before: Dict[str, Optional[Dict]],
         }
         if external_change:
             rec["external_change"] = True
+        # A non-regular path (symlink / fifo / socket / device) carries a hardcoded
+        # size 0 in its stub, so without `kind` the reader had no way to tell a
+        # symlink retarget from a 0-byte file edit and printed the security-relevant
+        # `ln -sf /etc/shadow link` as `modified: link (0 -> 0 bytes, +0)`. Mark the
+        # record so the renderer can say what actually happened. `link_changed`
+        # distinguishes a REPOINT from an unchanged link observed twice.
+        if b_nonreg or a_nonreg:
+            rec["kind"] = "non-regular"
+            if (b_nonreg and a_nonreg
+                    and _meta(b, "link_target") != _meta(a, "link_target")):
+                rec["link_changed"] = True
         # Annotate a mode transition (chmod) whenever both modes are known and
         # differ -- INDEPENDENT of whether content also changed. Gating this on
         # b_sha == a_sha dropped the permission change whenever a single tool call

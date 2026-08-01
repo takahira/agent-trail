@@ -233,7 +233,8 @@ emitf fix2 PostToolUse Edit config/g.env gedit     # Edit posts FIRST
 emitb fix2 PostToolUse "echo go" gbash             # Bash posts AFTER -> overlap by seq
 
 # G2: sc-1/REG-1 -- a doc that merely NAMES AWS_SECRET_ACCESS_KEY (no value) must
-# keep its content stored (the bare-substring sniff used to withhold it).
+# still be reported as a normal change (the bare-substring sniff used to withhold
+# it). Nothing is "stored" either way -- v0.2+ keeps no file content at all.
 emitf fix2 PreToolUse  Write docs/aws-setup.md awsdoc
 printf 'Set AWS_SECRET_ACCESS_KEY in CI before deploy.\n' > "$WORK/docs/aws-setup.md"
 emitf fix2 PostToolUse Write docs/aws-setup.md awsdoc
@@ -383,11 +384,35 @@ assert "S2 edit shown as modified"               "$SHOW"  "M config/app.yaml"
 assert "S3 opaque cmd: added file detected"      "$SHOW"  "A generated/report.txt"
 assert "S3 opaque cmd: deletion detected"        "$SHOW"  "D src/old.tmp"
 assert "S4 diff detects the script's change"     "$DIFF"  "modified: src/app.py"
-assert "S4 diff shows the size delta"            "$DIFF"  "bytes"
+# Not a bare "bytes" -- that matches any other file's line in a multi-file diff
+# and passes even if S4's own size delta is missing. Anchor it to S4's own line.
+if grep -E -- '^modified: src/app\.py +\([0-9,]+ -> [0-9,]+ bytes, [+-][0-9,]+\)$' \
+        "$DIFF" > /dev/null; then
+  echo "  OK: S4 diff shows the size delta on its own line"
+else
+  echo "  FAIL: S4 diff shows the size delta on its own line"; fail=1
+  grep -F -- "src/app.py" "$DIFF" | head -3
+fi
 refute "S4 diff never dumps content (-)"         "$DIFF"  "-value = 'foo'"
 refute "S4 diff never dumps content (+)"         "$DIFF"  "+value = 'bar'"
 assert "diff points at git for content"          "$DIFF"  "content is never stored"
-assert "binary file added, no bytes dumped"      "$DIFF"  "created: assets/logo.png"
+assert "S7 binary file added"                    "$DIFF"  "created: assets/logo.png"
+# The actual claim in the label: the file's own bytes must not reach the output.
+# Checked at the BYTE level in python -- `grep -F` cannot carry the NUL in the
+# payload (a pattern file containing \0 silently matches nothing, which is how a
+# "binary content leaked" assertion can look green while testing nothing).
+python3 - "$DIFF" <<'PYEOF'
+import pathlib, sys
+blob = pathlib.Path(sys.argv[1]).read_bytes()
+leaked = [name for name, needle in
+          (("payload", b"binary\x00data"), ("PNG magic", b"\x89PNG"))
+          if needle in blob]
+if leaked:
+    print("  FAIL: S7 binary content was dumped into the diff (%s)" % ", ".join(leaked))
+    sys.exit(1)
+print("  OK: S7 binary content is NOT dumped into the diff")
+PYEOF
+[ $? -eq 0 ] || fail=1
 assert "unicode+space filename intact"           "$SHOW"  "日本語"
 
 # sensitive detection -- the git-can't-do-this view
@@ -523,7 +548,10 @@ else
 fi
 # G4: unreadable after-snapshot -> notice, not a fabricated deletion.
 assert "G4 unreadable shows a notice"              "$DIFFG" "unreadable at snapshot"
-refute "G4 unreadable does NOT fake-delete line1"  "$DIFFG" "-line1"
+# The real risk is FABRICATING A DELETION for a file that merely became
+# unreadable. "-line1" could never appear (v0.2 emits no content hunks at all),
+# so refuting it tested nothing. Refute the deletion claim itself.
+refute "G4 unreadable is NOT reported as deleted"  "$DIFFG" "deleted: src/perm.txt"
 # G6: a Bash naming+writing a secret is counted once (no CMD-REF duplicate).
 assert "G6 secret write reported once"             "$AUDITG" "WROTE c.env"
 refute "G6 no duplicate CMD-REF for same secret"   "$AUDITG" "CMD-REF c.env"
