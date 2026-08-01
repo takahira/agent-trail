@@ -161,12 +161,22 @@ class TreeCeilingExceeded(Exception):
     """The whole-tree snapshot hit a ceiling; the snapshot for this event is
     skipped and the gap is recorded (never silently hidden)."""
 
-    def __init__(self, reason: str, files_seen: int, elapsed: float):
-        super().__init__("tree snapshot ceiling: {0} ({1} files, {2:.3f}s)".format(
-            reason, files_seen, elapsed))
-        self.reason = reason            # "file_count" | "time_budget"
+    def __init__(self, reason: str, files_seen: int, elapsed: float,
+                 detail: str = ""):
+        super().__init__("tree snapshot ceiling: {0} ({1} files, {2:.3f}s){3}".format(
+            reason, files_seen, elapsed, (" " + detail) if detail else ""))
+        # "file_count" | "time_budget" | "walk_error"
+        #
+        # walk_error is NOT a ceiling in the resource sense: it means part of the
+        # tree could not be enumerated (an unreadable directory, a vanished
+        # entry we could not stat). It travels the same path on purpose --
+        # an incomplete snapshot must be recorded as a gap, never rendered as
+        # "nothing changed". Silently skipping the subtree is how a change inside
+        # a mode-000 directory became an all-clear.
+        self.reason = reason
         self.files_seen = files_seen
         self.elapsed = elapsed
+        self.detail = detail
 
 # Sensitive-file matching. Bias: PRECISE (few false positives) over exhaustive.
 # Detection here is non-blocking -- a missed file is still logged as an access
@@ -1065,53 +1075,79 @@ def walk_worktree(cwd: str, store_base: Optional[str] = None,
     # the caller can skip the snapshot loudly) instead of grinding through an
     # arbitrarily large tree. Both default to None (unbounded) for direct callers;
     # snapshot_tree passes the ALOG_MAX_TREE_* values.
+    # os.walk is NOT usable here: CPython materialises the WHOLE scandir result
+    # into dirs/files before yielding the first tuple, so a directory holding
+    # millions of entries in ONE level blows past both ceilings (and can OOM the
+    # hook) before any check can run. We drive os.scandir ourselves and test the
+    # ceilings while consuming each DirEntry, before accumulating it.
+    #
+    # ``seen`` counts EVERY enumerated entry -- directories and fifos/sockets too,
+    # not just the files we keep. The cost being bounded is the enumeration, so
+    # that is what the ceiling has to measure.
     skip_abs = os.path.abspath(store_base) if store_base else None
     start = time.monotonic()
-    out = []
-    for root, dirs, files in os.walk(cwd, followlinks=False):
-        # One deadline check per directory: cheap, and a huge single directory is
-        # still bounded by the max_files check inside the file loop below.
-        if deadline is not None and time.monotonic() > deadline:
-            raise TreeCeilingExceeded("time_budget", len(out),
-                                      time.monotonic() - start)
-        # A symlink to a directory shows up in `dirs`. Record it (so a Bash symlink
-        # swap is visible) but never descend it; real subdirs (minus the skip list)
-        # stay for traversal.
-        keep = []
-        for d in dirs:
-            if d in TREE_SKIP_DIRS:
-                continue
-            dp = os.path.join(root, d)
-            if skip_abs is not None and os.path.abspath(dp) == skip_abs:
-                continue                       # the audit store itself -- never walk it
-            if os.path.islink(dp):
-                out.append(dp)
-                if max_files is not None and len(out) > max_files:
-                    raise TreeCeilingExceeded("file_count", len(out),
-                                              time.monotonic() - start)
-            else:
-                keep.append(d)
-        dirs[:] = keep
-        for name in files:
-            abs_path = os.path.join(root, name)
-            try:
-                st = os.lstat(abs_path)
-            except OSError:
-                continue
-            # Record symlinks too -- snapshot_file classifies them non-regular (via
-            # O_NOFOLLOW), so a Bash-created or -replaced symlink is no longer
-            # invisible to the tree diff. Other non-regular entries (fifo/socket/
-            # device) are still skipped.
-            if stat.S_ISLNK(st.st_mode) or stat.S_ISREG(st.st_mode):
-                out.append(abs_path)
-                if max_files is not None and len(out) > max_files:
-                    raise TreeCeilingExceeded("file_count", len(out),
-                                              time.monotonic() - start)
-                if (deadline is not None
-                        and len(out) % _TREE_DEADLINE_CHECK_EVERY == 0
-                        and time.monotonic() > deadline):
-                    raise TreeCeilingExceeded("time_budget", len(out),
-                                              time.monotonic() - start)
+    out: List[str] = []
+    seen = 0
+    stack = [cwd]
+
+    def _check(where: str = "") -> None:
+        if max_files is not None and seen > max_files:
+            raise TreeCeilingExceeded("file_count", seen, time.monotonic() - start)
+        if (deadline is not None
+                and seen % _TREE_DEADLINE_CHECK_EVERY == 0
+                and time.monotonic() > deadline):
+            raise TreeCeilingExceeded("time_budget", seen, time.monotonic() - start)
+
+    while stack:
+        current = stack.pop()
+        try:
+            it = os.scandir(current)
+        except OSError as exc:
+            # An unreadable directory used to be swallowed by os.walk's default
+            # error handling, so a change inside a mode-000 subtree produced
+            # "zero changes, no gap" -- a false all-clear. Refuse to pretend.
+            raise TreeCeilingExceeded(
+                "walk_error", seen, time.monotonic() - start,
+                "{0}: {1}".format(rel_to_cwd(cwd, current), exc.strerror or exc))
+        with it:
+            while True:
+                try:
+                    entry = next(it)
+                except StopIteration:
+                    break
+                except OSError as exc:
+                    raise TreeCeilingExceeded(
+                        "walk_error", seen, time.monotonic() - start,
+                        "{0}: {1}".format(rel_to_cwd(cwd, current),
+                                          exc.strerror or exc))
+                seen += 1
+                _check()
+                try:
+                    is_link = entry.is_symlink()
+                    is_dir = (not is_link) and entry.is_dir(follow_symlinks=False)
+                    is_reg = (not is_link) and entry.is_file(follow_symlinks=False)
+                except OSError as exc:
+                    # The entry vanished or cannot be stat'ed. Treating it as
+                    # absent would silently drop it from both snapshots and hide
+                    # a real change, so this is a gap too.
+                    raise TreeCeilingExceeded(
+                        "walk_error", seen, time.monotonic() - start,
+                        "{0}: {1}".format(rel_to_cwd(cwd, entry.path),
+                                          exc.strerror or exc))
+                if is_dir:
+                    if entry.name in TREE_SKIP_DIRS:
+                        continue
+                    if skip_abs is not None and os.path.abspath(entry.path) == skip_abs:
+                        continue           # the audit store itself -- never walk it
+                    stack.append(entry.path)
+                    continue
+                # Record symlinks too -- snapshot_file classifies them non-regular
+                # (via O_NOFOLLOW), so a Bash-created or -replaced symlink is not
+                # invisible to the tree diff. A symlink to a directory is recorded
+                # and never descended. Other non-regular entries (fifo/socket/
+                # device) are counted above but not recorded.
+                if is_link or is_reg:
+                    out.append(entry.path)
     return out
 
 

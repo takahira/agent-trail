@@ -586,8 +586,32 @@ def render_one_diff(ev: Dict, change: Dict) -> List[str]:
     return out
 
 
+GAP_KINDS = ("tree_snapshot_skipped", "events_dropped")
+
+
+def _gap_events(events: List[Dict]) -> List[Dict]:
+    """Recorded gaps: snapshots the hook skipped, events lost to a lock timeout.
+
+    These are the log SAYING it is incomplete. Any command that can print a
+    "nothing here" result must show them first, or it converts a known gap into a
+    clean bill of health -- the one thing an audit must never do.
+    """
+    return [e for e in events if e.get("kind") in GAP_KINDS]
+
+
+def _print_gaps(gaps: List[Dict], show_time: bool, multi: bool) -> None:
+    if not gaps:
+        return
+    print("!! this audit is INCOMPLETE -- {0} recorded gap(s):".format(len(gaps)))
+    for ev in gaps:
+        print("   " + render_nontool(ev, show_time, multi))
+    print()
+
+
 def cmd_diff(base: str, session: Optional[str], only_path: Optional[str]) -> int:
     events = load_events(base, session)
+    gaps = _gap_events(events)
+    _print_gaps(gaps, False, session is None and len({_sess(e) for e in events}) > 1)
     printed = 0
     for ev in events:
         for c in _changes(ev):
@@ -601,7 +625,9 @@ def cmd_diff(base: str, session: Optional[str], only_path: Optional[str]) -> int
             printed += 1
     if printed == 0:
         print("no file changes recorded"
-              + (" for {0}".format(only_path) if only_path else ""))
+              + (" for {0}".format(only_path) if only_path else "")
+              + (" (but see the gap(s) above -- absence here is NOT proof of none)"
+                 if gaps else ""))
     else:
         print("note: file content is never stored (salted digests + metadata only);")
         print("      for tracked files, `git diff` / `git log -p` has the content story.")
@@ -612,12 +638,17 @@ def cmd_audit(base: str, session: Optional[str], show_time: bool,
               fail_on_hit: bool = False) -> int:
     """Only the things git cannot show: sensitive accesses & command refs.
 
-    With fail_on_hit, returns 2 when any sensitive access is found, so the command
-    can gate a pre-commit hook / CI step (otherwise it always returns 0)."""
+    With fail_on_hit, returns 2 when any sensitive access is found and 3 when the
+    audit is INCOMPLETE (the log recorded a gap), so the command can gate a
+    pre-commit hook / CI step (otherwise it always returns 0). The two are
+    distinct exit codes because they need different responses: 2 means "a secret
+    was touched", 3 means "we cannot tell you whether one was"."""
     events = load_events(base, session)
     multi = session is None and len({_sess(e) for e in events}) > 1
+    gaps = _gap_events(events)
     hits = 0
     print("=== sensitive access audit ===")
+    _print_gaps(gaps, show_time, multi)
     for ev in events:
         seq = _seq(ev)
         # Default AND sanitize: an event missing 'tool' (corrupt/tampered log) would
@@ -650,12 +681,19 @@ def cmd_audit(base: str, session: Optional[str], show_time: bool,
                 # Matches summarize_event (sanitize/coerce first, then truncate).
                 _safe_inline(str(ev.get("command") or ""))[:50]))
     if hits == 0:
-        print("  (none) -- no sensitive files were accessed")
+        print("  (none) -- no sensitive files were accessed"
+              + (" IN WHAT WAS RECORDED (see the gap(s) above)" if gaps else ""))
     else:
         print()
         print("{0} sensitive access(es). NOTE: a plain `git diff` shows NONE of".format(hits))
         print("the read-only accesses above -- reading a secret leaves no git trace.")
-    return 2 if (fail_on_hit and hits) else 0
+    if not fail_on_hit:
+        return 0
+    if hits:
+        return 2
+    # No hits, but the log admits it is missing data: a gate must not report
+    # success on an audit that cannot see everything.
+    return 3 if gaps else 0
 
 
 def cmd_cost(base: str, session: Optional[str]) -> int:

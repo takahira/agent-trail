@@ -119,7 +119,7 @@ python3 alog.py show                     # git-status-like timeline of the sessi
 python3 alog.py diff                     # change detection (status/size/mode) per change
 python3 alog.py diff src/app.py          # one file
 python3 alog.py audit                    # ONLY the sensitive-file accesses
-python3 alog.py audit --fail-on-hit      # exit 2 if any secret was accessed (CI / pre-commit)
+python3 alog.py audit --fail-on-hit      # exit 2 = secret accessed, 3 = audit incomplete
 python3 alog.py cost                     # per-turn token usage + estimated cost
 ```
 
@@ -128,7 +128,12 @@ Common flags (before or after the subcommand):
 - `--session <id>` — restrict to one session (default: all)
 - `--data <dir>` — store location (default: `$ALOG_DATA` or `./.alog`)
 - `--time` — show timestamps (HH:MM:SS, UTC)
-- `--fail-on-hit` (`audit` only) — exit `2` when a sensitive access is found
+- `--fail-on-hit` (`audit` only) — exit `2` when a sensitive access is found, and
+  `3` when the log records a GAP (a skipped snapshot or dropped events). The two
+  are separate because they need different responses: `2` means a secret was
+  touched, `3` means the audit cannot tell you whether one was. `diff` and
+  `audit` both print any recorded gap before their results, so a "nothing here"
+  line is never mistaken for a clean bill of health.
 
 ## What you see
 

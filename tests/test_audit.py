@@ -3219,3 +3219,97 @@ class TestManifestDumpSkip(StoreTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestGapsAreNotAllClears(CeilingTestCase):
+    """#8 (HIGH): the hook records a gap, so the READER must not hide it.
+
+    `alog audit --fail-on-hit` printed "(none) -- no sensitive files were
+    accessed" and exited 0 over a log that said outright it had skipped a
+    snapshot. Wired into CI that is a green light on an audit that cannot see.
+    """
+
+    def _skip_a_snapshot(self, session="gap"):
+        os.environ["ALOG_MAX_TREE_FILES"] = "1"
+        for i in range(5):
+            self.wf("f{0}.txt".format(i), b"x")
+        payload = {"session_id": session, "cwd": self.work,
+                   "tool_input": {"command": "true"}}
+        hook.handle_pre(self.base, payload, "Bash", self.work, self.salt, "t1")
+        kinds = [e.get("kind") for e in hook.read_session_events(self.base, session)]
+        self.assertIn("tree_snapshot_skipped", kinds,
+                      "precondition: the hook must have recorded the gap")
+
+    def test_audit_surfaces_the_gap_and_fails_the_gate(self):
+        self._skip_a_snapshot()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = alog.cmd_audit(self.base, "gap", False, fail_on_hit=True)
+        out = buf.getvalue()
+        self.assertIn("INCOMPLETE", out, "the gap must be stated, not omitted")
+        self.assertIn("snapshot skipped", out)
+        self.assertEqual(rc, 3, "an incomplete audit must not exit 0 under --fail-on-hit")
+
+    def test_diff_surfaces_the_gap(self):
+        self._skip_a_snapshot("gap2")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            alog.cmd_diff(self.base, "gap2", None)
+        out = buf.getvalue()
+        self.assertIn("INCOMPLETE", out)
+        self.assertIn("NOT proof of none", out,
+                      "'no file changes recorded' must be qualified when data is missing")
+
+    def test_a_complete_audit_is_still_clean_and_exits_zero(self):
+        # The qualification must not fire when there is nothing to qualify.
+        self.wf("a.txt", b"x")
+        payload = {"session_id": "clean", "cwd": self.work,
+                   "tool_input": {"command": "true"}}
+        hook.handle_pre(self.base, payload, "Bash", self.work, self.salt, "t1")
+        hook.handle_post(self.base, payload, "Bash", self.work, self.salt, "t1")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = alog.cmd_audit(self.base, "clean", False, fail_on_hit=True)
+        out = buf.getvalue()
+        self.assertNotIn("INCOMPLETE", out)
+        self.assertIn("(none)", out)
+        self.assertEqual(rc, 0)
+
+
+class TestWalkErrorIsAGap(CeilingTestCase):
+    """#8 (HIGH): an unreadable subtree used to read as "nothing changed"."""
+
+    def test_unreadable_directory_raises_a_walk_error_gap(self):
+        blocked = os.path.join(self.work, "blocked")
+        os.makedirs(blocked)
+        self.wf("blocked/secret.txt", b"changed behind your back")
+        os.chmod(blocked, 0o000)
+        try:
+            with self.assertRaises(hook.TreeCeilingExceeded) as ctx:
+                hook.walk_worktree(self.work)
+            self.assertEqual(ctx.exception.reason, "walk_error")
+            self.assertIn("blocked", ctx.exception.detail)
+        finally:
+            os.chmod(blocked, 0o755)
+
+    def test_flat_directory_is_bounded_while_enumerating(self):
+        # os.walk materialised the whole scandir result before the first check,
+        # so a single huge directory outran both ceilings. The explicit scandir
+        # traversal must trip while consuming entries.
+        for i in range(200):
+            self.wf("f{0}".format(i), b"x")
+        with self.assertRaises(hook.TreeCeilingExceeded) as ctx:
+            hook.walk_worktree(self.work, max_files=50)
+        self.assertEqual(ctx.exception.reason, "file_count")
+        self.assertLessEqual(ctx.exception.files_seen, 60,
+                             "must stop near the ceiling, not after the whole listing")
+
+    def test_symlinks_are_still_recorded_and_never_descended(self):
+        os.makedirs(os.path.join(self.work, "real"))
+        self.wf("real/a.txt", b"a")
+        os.symlink(os.path.join(self.work, "real"), os.path.join(self.work, "linkdir"))
+        got = hook.walk_worktree(self.work)
+        names = sorted(os.path.relpath(p, self.work) for p in got)
+        self.assertIn("linkdir", names, "a symlinked dir must be recorded")
+        self.assertNotIn(os.path.join("linkdir", "a.txt"), names,
+                         "a symlinked dir must not be descended")
