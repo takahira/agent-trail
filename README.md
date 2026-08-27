@@ -79,7 +79,10 @@ pipx install git+https://github.com/takahira/agent-trail.git   # gives you `alog
 > the hook is wired by absolute path, never imported). So **`git clone` the repo to
 > get `hook.py`** and point your settings at `<clone>/hook.py` even if you also
 > `pipx install` the reader.
-> PyPI publishing (`pipx install agent-trail`) is planned.
+> PyPI publishing is planned under the distribution name **`alog-trail`**
+> (`pipx install alog-trail`). Note that the PyPI project named `agent-trail`
+> is an unrelated package by a different author and is **not** this project --
+> do not install it.
 
 ## Wire the hook
 

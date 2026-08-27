@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-trail"
+name = "alog-trail"
 description = "Local, offline audit log for AI coding agents: detect opaque Bash effects, secret reads, prompts, and token cost that git diff cannot show -- file contents are never stored"
 readme = "README.md"
 requires-python = ">=3.9"
