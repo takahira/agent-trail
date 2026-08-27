@@ -15,7 +15,9 @@ jobs:
   notify:
     # The empty-SLACK_WEBHOOK_URL check in the step below prevents forks from
     # firing even if they happen to set the secret.
-    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    # workflow_run uses this repository's secrets even for fork PR runs, so the
+    # head_repository check prevents untrusted forks from triggering Slack.
+    if: ${{ github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.head_repository.full_name == github.repository }}
     runs-on: ubuntu-latest
     steps:
       - name: Notify Slack
