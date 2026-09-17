@@ -12,10 +12,9 @@ Reads the local NDJSON event log and reports, fully offline:
 
 The timeline also carries non-tool event kinds git never sees: ``prompt``
 (what the agent was asked, redacted), ``turn`` (per-message token usage), and
-two GAP markers -- ``tree_snapshot_skipped`` (a whole-tree snapshot the hook
-skipped because a walk ceiling was hit) and ``events_dropped`` (events lost to
-session-lock timeouts) -- so a hole in the audit reads as a hole, never as a
-false all-clear.
+GAP markers -- ones recorded by the hook when capture was incomplete, plus ones
+synthesised by this reader when a session file or line cannot be loaded -- so a
+hole in the audit reads as a hole, never as a false all-clear.
 ``cost`` derives dollars from the recorded tokens and the MODEL_PRICING table in
 this file -- a rough estimate, not a billing source; tokens are the ground truth.
 
@@ -247,6 +246,13 @@ def list_session_ids(base: str) -> List[str]:
 
 
 def load_events(base: str, session: Optional[str]) -> List[Dict]:
+    """Load valid event objects and synthesise counted gap events for lost input.
+
+    A returned ``session_file_unreadable`` has count 1; a returned
+    ``session_lines_undecodable`` counts the malformed JSON lines in that session.
+    Keeping these in the event list makes every audit consumer see incompleteness
+    through the same GAP_KINDS path as gaps recorded by the hook itself.
+    """
     ids = [session] if session else list_session_ids(base)
     events: List[Dict] = []
     for sid in ids:
@@ -254,15 +260,31 @@ def load_events(base: str, session: Optional[str]) -> List[Dict]:
         # Open a REGULAR file only, via a non-following/non-blocking fd: a crafted
         # store where `<sid>.ndjson` is a directory (IsADirectoryError), a symlink, or
         # a FIFO (blocking read) would otherwise crash or hang the reader. Per-session
-        # try/except so one bad session file is skipped, not fatal. errors="replace"
-        # keeps a torn byte from dropping the whole command.
+        # try/except so one bad session file is not fatal. It MUST still become a
+        # gap, though: silently skipping it makes `audit --fail-on-hit` return a
+        # false all-clear over events it could not inspect. errors="replace" keeps
+        # a torn byte from dropping the whole command; invalid JSON below is likewise
+        # counted and represented by a synthetic gap event.
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
-        except OSError:
+        except FileNotFoundError:
+            # An explicitly selected, never-recorded session has historically read
+            # as empty. Preserve that behaviour; if an all-session listing found the
+            # file and it disappeared before open, that race IS a load gap.
+            if session is None:
+                events.append({"kind": "session_file_unreadable", "session": sid,
+                               "count": 1, "synthetic": True})
             continue
+        except OSError:
+            events.append({"kind": "session_file_unreadable", "session": sid,
+                           "count": 1, "synthetic": True})
+            continue
+        undecodable = 0
         try:
             with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
                 if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                    events.append({"kind": "session_file_unreadable", "session": sid,
+                                   "count": 1, "synthetic": True})
                     continue
                 for line in fh:
                     line = line.strip()
@@ -271,11 +293,16 @@ def load_events(base: str, session: Optional[str]) -> List[Dict]:
                     try:
                         obj = json.loads(line)
                     except ValueError:
+                        undecodable += 1
                         continue
                     if isinstance(obj, dict):
                         events.append(obj)
         except OSError:
-            continue
+            events.append({"kind": "session_file_unreadable", "session": sid,
+                           "count": 1, "synthetic": True})
+        if undecodable:
+            events.append({"kind": "session_lines_undecodable", "session": sid,
+                           "count": undecodable, "synthetic": True})
     # Sort by (ts, session, seq): seq is per-session, so without the session key
     # a default all-sessions view interleaves and shows colliding seq numbers.
     # Coerce every key defensively (see _snum): one corrupt/tampered line with a
@@ -343,7 +370,7 @@ def summarize_event(ev: Dict) -> str:
 
 
 def render_nontool(ev: Dict, show_time: bool, multi: bool) -> str:
-    """One timeline line for a prompt or turn event (no file changes)."""
+    """One timeline line for a prompt, turn, or gap event (no file changes)."""
     seq = _seq(ev)
     head = "[#{0:02d}] {1}{2}".format(seq, fmt_time(ev.get("ts"), show_time),
                                       sess_tag(ev, multi))
@@ -363,6 +390,14 @@ def render_nontool(ev: Dict, show_time: bool, multi: bool) -> str:
         return ("{0}{1:<7} {2} event(s) dropped on session-lock timeout"
                 " -- accesses in the gap were NOT recorded").format(
             head, "dropped", _num(ev.get("count")))
+    if ev.get("kind") == "session_file_unreadable":
+        return ("{0}{1:<7} {2} session log file(s) could not be safely read"
+                " -- events in the file NOT loaded").format(
+            head, "load", _num(ev.get("count")))
+    if ev.get("kind") == "session_lines_undecodable":
+        return ("{0}{1:<7} {2} undecodable line(s) in session log"
+                " -- events on those lines NOT loaded").format(
+            head, "load", _num(ev.get("count")))
     # turn
     cost = turn_cost(ev)
     cost_s = "~${0:.4f}".format(cost) if cost is not None else "cost: price n/a"
@@ -535,8 +570,8 @@ def cmd_show(base: str, session: Optional[str], show_time: bool) -> int:
     n_sens = 0
     for ev in events:
         kind = ev.get("kind")
-        if kind in ("prompt", "turn", "tree_snapshot_skipped", "events_dropped"):
-            # Non-tool events (what was asked / token cost / recorded GAPS) sit
+        if kind in ("prompt", "turn") or kind in GAP_KINDS:
+            # Non-tool events (what was asked / token cost / GAP markers) sit
             # inline in the timeline by seq; they carry no file changes so we
             # render + skip.
             print(render_nontool(ev, show_time, multi))
@@ -658,27 +693,42 @@ def render_one_diff(ev: Dict, change: Dict) -> List[str]:
 
 
 def legacy_object_store(base: str) -> bool:
-    """True if this store still has the v0.1 `objects/` content-addressed store.
+    """True if this store may still hold content in the v0.1 `objects/` store.
 
     v0.2 stopped writing file bytes but does not delete an existing `objects/`, so
     a store upgraded in place still holds the old content on disk. Any claim that
-    "content is never stored" is false for such a store and must say so instead."""
+    "content is never stored" is false for such a store and must say so instead.
+    An inspection error also returns True: unknown must select the warning, not the
+    reassuring claim.
+    """
+    path = os.path.join(base, "objects")
     try:
-        return os.path.isdir(os.path.join(base, "objects")) \
-            and bool(os.listdir(os.path.join(base, "objects")))
-    except OSError:
+        st = os.stat(path)
+    except FileNotFoundError:
         return False
+    except OSError:
+        # Unknown is not evidence that the legacy content store is empty. Fail
+        # toward the warning instead of making the stronger no-content claim.
+        return True
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    try:
+        return bool(os.listdir(path))
+    except OSError:
+        return True
 
 
-GAP_KINDS = ("tree_snapshot_skipped", "events_dropped")
+GAP_KINDS = ("tree_snapshot_skipped", "events_dropped",
+             "session_file_unreadable", "session_lines_undecodable")
 
 
 def _gap_events(events: List[Dict]) -> List[Dict]:
-    """Recorded gaps: snapshots the hook skipped, events lost to a lock timeout.
+    """Recorded or reader-detected gaps in the event stream.
 
-    These are the log SAYING it is incomplete. Any command that can print a
-    "nothing here" result must show them first, or it converts a known gap into a
-    clean bill of health -- the one thing an audit must never do.
+    These are either the log SAYING it is incomplete or the reader detecting that
+    it could not load part of the log. Any command that can print a "nothing here"
+    result must show them first, or it converts a known gap into a clean bill of
+    health -- the one thing an audit must never do.
     """
     return [e for e in events if e.get("kind") in GAP_KINDS]
 
@@ -686,7 +736,7 @@ def _gap_events(events: List[Dict]) -> List[Dict]:
 def _print_gaps(gaps: List[Dict], show_time: bool, multi: bool) -> None:
     if not gaps:
         return
-    print("!! this audit is INCOMPLETE -- {0} recorded gap(s):".format(len(gaps)))
+    print("!! this audit is INCOMPLETE -- {0} gap(s):".format(len(gaps)))
     for ev in gaps:
         print("   " + render_nontool(ev, show_time, multi))
     print()
@@ -732,10 +782,10 @@ def cmd_audit(base: str, session: Optional[str], show_time: bool,
     """Only the things git cannot show: sensitive accesses & command refs.
 
     With fail_on_hit, returns 2 when any sensitive access is found and 3 when the
-    audit is INCOMPLETE (the log recorded a gap), so the command can gate a
-    pre-commit hook / CI step (otherwise it always returns 0). The two are
-    distinct exit codes because they need different responses: 2 means "a secret
-    was touched", 3 means "we cannot tell you whether one was"."""
+    audit is INCOMPLETE (the log recorded a gap or the reader detected one), so
+    the command can gate a pre-commit hook / CI step (otherwise it always returns
+    0). The two are distinct exit codes because they need different responses: 2
+    means "a secret was touched", 3 means "we cannot tell you whether one was"."""
     events = load_events(base, session)
     multi = session is None and len({_sess(e) for e in events}) > 1
     gaps = _gap_events(events)
@@ -784,8 +834,8 @@ def cmd_audit(base: str, session: Optional[str], show_time: bool,
         return 0
     if hits:
         return 2
-    # No hits, but the log admits it is missing data: a gate must not report
-    # success on an audit that cannot see everything.
+    # No hits, but recorded or detected gaps say data is missing: a gate must not
+    # report success on an audit that cannot see everything.
     return 3 if gaps else 0
 
 
@@ -864,7 +914,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_diff.add_argument("path", nargs="?", default=None, help="restrict to one path")
     p_audit = sub.add_parser("audit", help="sensitive-file accesses only", parents=[common])
     p_audit.add_argument("--fail-on-hit", action="store_true", default=argparse.SUPPRESS,
-                         help="exit nonzero (2) if any sensitive access is found (for CI)")
+                         help="exit 2 on sensitive access, 3 if audit is incomplete (for CI)")
     sub.add_parser("cost", help="token usage & estimated cost per model", parents=[common])
 
     args = parser.parse_args(argv)

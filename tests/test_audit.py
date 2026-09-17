@@ -1345,6 +1345,17 @@ class TestCost(unittest.TestCase):
         self.assertIsNone(alog.turn_cost({"model": "claude-opus-9",
                                           "input_tokens": 1_000_000}))
 
+    def test_readme_example_costs_match_current_pricing(self):
+        opus = {"model": "claude-opus-4-8", "input_tokens": 4,
+                "output_tokens": 500, "cache_read_input_tokens": 20_000,
+                "cache_creation_input_tokens": 40_000}
+        haiku = {"model": "claude-haiku-4-5", "input_tokens": 800,
+                 "output_tokens": 120, "cache_read_input_tokens": 2_000,
+                 "cache_creation_input_tokens": 0}
+        self.assertAlmostEqual(alog.turn_cost(opus), 0.27252)
+        self.assertAlmostEqual(alog.turn_cost(haiku), 0.0016)
+        self.assertEqual(alog.cost_summary([opus, haiku]), (63_424, 0.27412, 0))
+
     def test_turn_tokens_sums_all_four(self):
         ev = {"input_tokens": 1, "output_tokens": 2,
               "cache_creation_input_tokens": 3, "cache_read_input_tokens": 4}
@@ -2583,10 +2594,13 @@ class TestRoundSixFixes(StoreTestCase):
                  if e.get("kind") == "turn"]
         self.assertEqual(turns, [])                  # refused, did not hang/record
 
-    # ---- C2: a directory session file doesn't crash the reader ----
-    def test_c2_directory_session_file_no_crash(self):
+    # ---- C2: a directory session file doesn't crash or disappear in the reader ----
+    def test_c2_directory_session_file_is_a_gap(self):
         os.makedirs(os.path.join(self.base, "sessions", "bad.ndjson"))
-        self.assertEqual(alog.load_events(self.base, None), [])   # skipped, no raise
+        evs = alog.load_events(self.base, None)                  # no raise
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["kind"], "session_file_unreadable")
+        self.assertEqual(evs[0]["count"], 1)
 
     # ---- C3: a list-valued model doesn't crash cost ----
     def test_c3_list_model_no_crash(self):
@@ -3340,6 +3354,71 @@ class TestGapsAreNotAllClears(CeilingTestCase):
         self.assertIn("(none)", out)
         self.assertEqual(rc, 0)
 
+    def test_unreadable_session_file_is_a_gap_and_fails_the_gate(self):
+        hook._append_event(self.base, "blocked", {
+            "seq": 1, "session": "blocked", "tool": "Read",
+            "changes": [{"path": ".env", "status": "read", "sensitive": True}]})
+        path = hook.session_file(self.base, "blocked")
+        os.chmod(path, 0o000)
+        try:
+            # Root can bypass mode bits; this platform cannot exercise chmod-based
+            # denial faithfully, so leave that integration case to a non-root run.
+            try:
+                fd = os.open(path, os.O_RDONLY)
+            except OSError:
+                pass
+            else:
+                os.close(fd)
+                self.skipTest("current user can read a chmod 000 file")
+            evs = alog.load_events(self.base, "blocked")
+            gaps = alog._gap_events(evs)
+            self.assertEqual([(e["kind"], e["count"]) for e in gaps],
+                             [("session_file_unreadable", 1)])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = alog.main(["--data", self.base, "--session", "blocked",
+                                "audit", "--fail-on-hit"])
+            out = buf.getvalue()
+            self.assertIn("INCOMPLETE", out)
+            self.assertIn("could not be safely read", out)
+            self.assertEqual(rc, 3)
+        finally:
+            os.chmod(path, 0o600)
+
+    def test_truncated_final_line_is_a_gap_and_fails_the_gate(self):
+        path = hook.session_file(self.base, "torn")
+        with open(path, "w", encoding="utf-8") as fh:
+            # This was a sensitive Read event before its final NDJSON record tore.
+            fh.write('{"seq":1,"session":"torn","tool":"Read","changes":[')
+        evs = alog.load_events(self.base, "torn")
+        gaps = alog._gap_events(evs)
+        self.assertEqual([(e["kind"], e["count"]) for e in gaps],
+                         [("session_lines_undecodable", 1)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = alog.main(["--data", self.base, "--session", "torn",
+                            "audit", "--fail-on-hit"])
+        out = buf.getvalue()
+        self.assertIn("INCOMPLETE", out)
+        self.assertIn("1 undecodable line(s)", out)
+        self.assertIn("IN WHAT WAS RECORDED", out)
+        self.assertEqual(rc, 3)
+
+    def test_load_gap_does_not_hide_a_valid_sensitive_event(self):
+        hook._append_event(self.base, "mixed", {
+            "seq": 1, "session": "mixed", "tool": "Read",
+            "changes": [{"path": ".env", "status": "read", "sensitive": True}]})
+        with open(hook.session_file(self.base, "mixed"), "a", encoding="utf-8") as fh:
+            fh.write("{torn final record")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = alog.cmd_audit(self.base, "mixed", False, fail_on_hit=True)
+        out = buf.getvalue()
+        self.assertIn("INCOMPLETE", out)
+        self.assertIn(".env", out)
+        self.assertIn("1 sensitive access(es)", out)
+        self.assertEqual(rc, 2)
+
 
 class TestWalkErrorIsAGap(CeilingTestCase):
     """#8 (HIGH): an unreadable subtree used to read as "nothing changed"."""
@@ -3746,6 +3825,27 @@ class TestLegacyObjectStoreWarning(StoreTestCase):
         self._one_change("s3")
         self.assertFalse(alog.legacy_object_store(self.base))
         self.assertIn("never stored", self._diff("s3"))
+
+    def test_unreadable_objects_dir_fails_toward_the_warning(self):
+        objects = os.path.join(self.base, "objects")
+        os.makedirs(objects)
+        with open(os.path.join(objects, "ab12"), "w", encoding="utf-8") as fh:
+            fh.write("stored file content from v0.1")
+        self._one_change("s4")
+        os.chmod(objects, 0o000)
+        try:
+            try:
+                os.listdir(objects)
+            except OSError:
+                pass
+            else:
+                self.skipTest("current user can list a chmod 000 directory")
+            self.assertTrue(alog.legacy_object_store(self.base))
+            out = self._diff("s4")
+            self.assertIn("HOLDS FILE CONTENT", out)
+            self.assertNotIn("content is never stored", out)
+        finally:
+            os.chmod(objects, 0o700)
 
 
 class TestLegacyPlainHexEventRenders(StoreTestCase):

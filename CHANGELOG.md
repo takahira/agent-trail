@@ -9,9 +9,11 @@ re-hash the first time a sensitive file is seen again.
 ### An audit gap no longer renders as a clean bill of health
 
 `alog audit --fail-on-hit` and `alog diff` printed their normal "(none)" result
-over a session whose snapshot had been **skipped** for exceeding a ceiling. Wired
+over a session whose snapshot had been **skipped** for exceeding a ceiling. The
+same false all-clear occurred when a session file was unreadable or an NDJSON line
+was truncated, because the reader silently discarded those load failures. Wired
 into CI that is a green light over an audit that could not see. Both commands now
-print any `tree_snapshot_skipped` / `events_dropped` before their results, and
+print recorded gaps and reader-detected load gaps before their results, and
 `--fail-on-hit` exits **3** when the audit is incomplete -- kept distinct from the
 existing 2, because "a secret was touched" and "we cannot say whether one was"
 need different responses.
@@ -70,7 +72,8 @@ borrowing a neighbour's rate.
   a string, so one junk line renders as unknown and the audit still runs.
 - `alog diff` no longer claims "file content is never stored" when reading a
   **legacy v0.1 store**: v0.2 stopped writing `objects/` but never deletes an
-  existing one, so an upgraded store still holds the bytes. It now warns instead.
+  existing one, so an upgraded store still holds the bytes. It now warns instead,
+  including when permissions prevent it from proving that `objects/` is empty.
 - A **symlink retarget** (`ln -sf /etc/shadow link`) rendered as
   `modified: link (0 -> 0 bytes, +0)`, because a non-regular record carries a
   hardcoded size 0. Change records now carry `kind`/`link_changed` and the reader

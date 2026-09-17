@@ -135,11 +135,12 @@ Common flags (before or after the subcommand):
 - `--data <dir>` — store location (default: `$ALOG_DATA` or `./.alog`)
 - `--time` — show timestamps (HH:MM:SS, UTC)
 - `--fail-on-hit` (`audit` only) — exit `2` when a sensitive access is found, and
-  `3` when the log records a GAP (a skipped snapshot or dropped events). The two
-  are separate because they need different responses: `2` means a secret was
-  touched, `3` means the audit cannot tell you whether one was. `diff` and
-  `audit` both print any recorded gap before their results, so a "nothing here"
-  line is never mistaken for a clean bill of health.
+  `3` when the log has a GAP (a skipped snapshot, dropped events, an unreadable
+  session file, or an undecodable line). The two are separate because they need
+  different responses: `2` means a secret was touched, `3` means the audit cannot
+  tell you whether one was. `diff` and `audit` both print any recorded or detected
+  gap before their results, so a "nothing here" line is never mistaken for a clean
+  bill of health.
 
 ## What you see
 
@@ -177,14 +178,13 @@ Prompts and token/cost events are woven into the same `seq`-ordered timeline, an
 `alog cost` aggregates per model:
 
 ```text
-=== alog cost ===
-  model             turns     input    output  cache_read     cache_wr  est. cost
-  opus-4-8              1         4       500      20,000       40,000  ~$0.8176
-  haiku-4-5             1       800       120       2,000            0  ~$0.0016
+=== token usage & estimated cost (estimate) ===
+  model             turns     input    output  cache_read    cache_wr  est. cost
+  opus-4-8              1         4       500      20,000      40,000  ~$0.2725
+  haiku-4-5             1       800       120       2,000           0  ~$0.0016
 
-  TOTAL: 2 turn(s), 63,424 tokens, est. cost ~$0.8192
-  NOTE: cost is a rough estimate from MODEL_PRICING in alog.py (update rates there);
-        tokens are the recorded ground truth.
+  TOTAL: 2 turn(s), 63,424 tokens, est. cost ~$0.2741
+  NOTE: cost is a rough estimate from MODEL_PRICING in alog.py (update rates there); tokens are the recorded ground truth.
 ```
 
 ---
