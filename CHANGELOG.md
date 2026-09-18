@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-Follow-up fixes from the round-8 audit (#8). No format or CLI break: an existing
+Follow-up fixes from the round-8 audit (#8). No format break: an existing
 store keeps working, and the one on-disk change (below) costs at most a single
-re-hash the first time a sensitive file is seen again.
+re-hash the first time a sensitive file is seen again. The only CLI change is the
+`--session ""` edge case noted under *Reader robustness*.
 
 ### An audit gap no longer renders as a clean bill of health
 
@@ -80,6 +81,16 @@ borrowing a neighbour's rate.
   names the repoint.
 - The large-file notice stringified `before_size`/`after_size` directly, bypassing
   the tampered-log guard the rest of the renderer applies.
+- **`--session` could name a file outside the store.** The value was joined into
+  `sessions/<sid>.ndjson` unchecked, so `alog --session ../../elsewhere/log show`
+  read and printed NDJSON from anywhere the user could read -- even though the
+  loader already refused symlinks, FIFOs and directories for the file it opened.
+  A session id containing a path separator (or NUL) is now rejected before any
+  read, for every subcommand. In-store names stay readable however odd
+  (`bad id.ndjson`, `..ndjson`, `.ndjson`), so one such file cannot abort
+  `alog sessions`. The one CLI edge case this changes: an explicit
+  `--session ""` used to fall through to *every* session; it now means the
+  session stored as `.ndjson` (usually none, so an empty result).
 
 ### Tests and demo (#3 Tier 3)
 

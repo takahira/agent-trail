@@ -4071,6 +4071,24 @@ class TestSessionIdValidation(StoreTestCase):
         with contextlib.redirect_stdout(buf):
             self.assertEqual(alog.cmd_sessions(self.base), 0)
 
+    def test_an_empty_named_session_file_is_one_session_not_all(self):
+        """'.ndjson' lists as the id ''. It must neither abort `alog sessions` nor be
+        mistaken for "no --session given" and pull in every other session."""
+        d = alog.sessions_dir(self.base)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, ".ndjson"), "w", encoding="utf-8") as fh:
+            fh.write('{"ts":1,"seq":1,"kind":"tool","session":"x"}\n')
+        with open(os.path.join(d, "real.ndjson"), "w", encoding="utf-8") as fh:
+            fh.write('{"ts":1,"seq":1,"kind":"tool","session":"real"}\n'
+                     '{"ts":2,"seq":2,"kind":"tool","session":"real"}\n')
+        self.assertIn("", alog.list_session_ids(self.base))
+        self.assertEqual(len(alog.load_events(self.base, "")), 1)
+        self.assertEqual(len(alog.load_events(self.base, None)), 3)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(alog.cmd_sessions(self.base), 0)
+        self.assertIn("real", buf.getvalue())
+
     def test_validator_accepts_exactly_what_the_hook_writes(self):
         """_safe_session is the writer; every name it can emit must be readable."""
         for raw in ("plain", "a/b", "a_b", "", "..", "日本語", 1, ["x"]):

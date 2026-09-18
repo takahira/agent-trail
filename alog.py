@@ -258,8 +258,12 @@ _SESSION_ID_FORBIDDEN = tuple(c for c in ("/", os.sep, os.altsep, "\0") if c)
 
 
 def valid_session_id(session: str) -> bool:
-    """True when ``session`` can only name a file directly inside the store."""
-    return bool(session) and not any(c in session for c in _SESSION_ID_FORBIDDEN)
+    """True when ``session`` can only name a file directly inside the store.
+
+    The empty id is valid too: it names ``sessions/.ndjson``, which
+    ``list_session_ids`` returns as ``""`` and ``alog sessions`` must still list.
+    """
+    return not any(c in session for c in _SESSION_ID_FORBIDDEN)
 
 
 def load_events(base: str, session: Optional[str]) -> List[Dict]:
@@ -275,7 +279,8 @@ def load_events(base: str, session: Optional[str]) -> List[Dict]:
             "invalid --session {0!r}: a session id names a file inside the "
             "store and may not contain a path separator. "
             "Run `alog sessions` to list the recorded ids.".format(session))
-    ids = [session] if session else list_session_ids(base)
+    # `is not None`, not truthiness: "" is a real id (sessions/.ndjson), not "all".
+    ids = [session] if session is not None else list_session_ids(base)
     events: List[Dict] = []
     for sid in ids:
         path = os.path.join(sessions_dir(base), sid + ".ndjson")
