@@ -245,6 +245,23 @@ def list_session_ids(base: str) -> List[str]:
             if n.endswith(".ndjson")]
 
 
+# A session id names ONE file directly inside sessions/: the path is
+# sessions/<sid>.ndjson. What keeps a crafted ``--session`` ('../../elsewhere/log',
+# '/etc/x') from joining its way out of the store is that it contains no path
+# separator. '.' and '..' are NOT special here: they become '..ndjson' /
+# '...ndjson', ordinary files inside sessions/ (and ones `alog sessions` can list).
+# The rest of this loader hardens the FILE it opens (regular-only, O_NOFOLLOW,
+# non-blocking) but never questioned WHICH file. Deliberately NOT a character
+# whitelist: a listed odd name must stay readable, or one such file would abort
+# `alog sessions` for every session.
+_SESSION_ID_FORBIDDEN = tuple(c for c in ("/", os.sep, os.altsep, "\0") if c)
+
+
+def valid_session_id(session: str) -> bool:
+    """True when ``session`` can only name a file directly inside the store."""
+    return bool(session) and not any(c in session for c in _SESSION_ID_FORBIDDEN)
+
+
 def load_events(base: str, session: Optional[str]) -> List[Dict]:
     """Load valid event objects and synthesise counted gap events for lost input.
 
@@ -253,6 +270,11 @@ def load_events(base: str, session: Optional[str]) -> List[Dict]:
     Keeping these in the event list makes every audit consumer see incompleteness
     through the same GAP_KINDS path as gaps recorded by the hook itself.
     """
+    if session is not None and not valid_session_id(session):
+        raise SystemExit(
+            "invalid --session {0!r}: a session id names a file inside the "
+            "store and may not contain a path separator. "
+            "Run `alog sessions` to list the recorded ids.".format(session))
     ids = [session] if session else list_session_ids(base)
     events: List[Dict] = []
     for sid in ids:

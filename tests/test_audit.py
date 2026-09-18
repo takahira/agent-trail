@@ -4012,3 +4012,67 @@ class TestCursorSurvivesInodeReuse(StoreTestCase):
             json.dump({"offset": 400, "path": tpath,
                        "dev": st.st_dev, "ino": st.st_ino}, fh)
         self.assertEqual(hook.read_cursor(self.base, "s4", tpath), 0)
+
+
+class TestSessionIdValidation(StoreTestCase):
+    """--session names a file inside the store; it must not be able to name one
+    outside it. The loader already hardens the file it opens (regular-only,
+    O_NOFOLLOW); this covers WHICH file it is allowed to open."""
+
+    def _outside(self, content):
+        p = os.path.join(self.tmp, "outside.ndjson")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return p
+
+    def test_a_traversing_session_id_is_rejected_before_any_read(self):
+        self._outside('{"ts":1,"kind":"tool","command":"SECRET-CMD"}\n')
+        for sid in ("../outside", "../../outside", "a/../../outside",
+                    "/etc/passwd", "a\0b"):
+            with self.subTest(sid=sid):
+                with self.assertRaises(SystemExit) as cm:
+                    alog.load_events(self.base, sid)
+                self.assertIn("invalid --session", str(cm.exception))
+                self.assertNotIn("SECRET-CMD", str(cm.exception))
+
+    def test_recorded_ids_still_load(self):
+        os.makedirs(alog.sessions_dir(self.base), exist_ok=True)
+        with open(os.path.join(alog.sessions_dir(self.base), "s-1.ndjson"),
+                  "w", encoding="utf-8") as fh:
+            fh.write('{"ts":1,"seq":1,"kind":"tool","session":"s-1"}\n')
+        self.assertEqual(len(alog.load_events(self.base, "s-1")), 1)
+        self.assertTrue(alog.valid_session_id("s-1"))
+        self.assertTrue(alog.valid_session_id("0a1b2c3d.e4f5"))
+
+    def test_odd_but_in_store_names_stay_readable(self):
+        """A listed file like 'bad id.ndjson' is inside the store: rejecting it would
+        make `alog sessions` abort for every session because of one odd name."""
+        os.makedirs(alog.sessions_dir(self.base), exist_ok=True)
+        with open(os.path.join(alog.sessions_dir(self.base), "bad id.ndjson"),
+                  "w", encoding="utf-8") as fh:
+            fh.write('{"ts":1,"seq":1,"kind":"tool","session":"bad id"}\n')
+        self.assertIn("bad id", alog.list_session_ids(self.base))
+        self.assertEqual(len(alog.load_events(self.base, "bad id")), 1)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(alog.cmd_sessions(self.base), 0)
+        self.assertIn("bad id", buf.getvalue())
+
+    def test_dot_named_session_files_stay_inside_the_store(self):
+        """'..ndjson' / '...ndjson' list as '.' / '..'; they are files in sessions/,
+        not directory references, so listing and loading them must not abort."""
+        d = alog.sessions_dir(self.base)
+        os.makedirs(d, exist_ok=True)
+        for sid in (".", ".."):
+            with open(os.path.join(d, sid + ".ndjson"), "w", encoding="utf-8") as fh:
+                fh.write('{"ts":1,"seq":1,"kind":"tool","session":"x"}\n')
+            self.assertEqual(len(alog.load_events(self.base, sid)), 1)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(alog.cmd_sessions(self.base), 0)
+
+    def test_validator_accepts_exactly_what_the_hook_writes(self):
+        """_safe_session is the writer; every name it can emit must be readable."""
+        for raw in ("plain", "a/b", "a_b", "", "..", "日本語", 1, ["x"]):
+            with self.subTest(raw=raw):
+                self.assertTrue(alog.valid_session_id(hook._safe_session(raw)))

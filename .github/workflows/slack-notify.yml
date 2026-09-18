@@ -45,4 +45,4 @@ jobs:
           # -f so a non-2xx Slack response (revoked/invalid webhook, 429) makes
           # curl exit non-zero and fails this step. Without it curl exits 0 on
           # any HTTP status and a delivery failure would pass silently.
-          curl -sSf -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
+          curl -sSf --retry 3 --retry-delay 2 --retry-all-errors -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
