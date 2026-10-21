@@ -2192,6 +2192,41 @@ class TestThirdReviewFindings(StoreTestCase):
         self.assertNotIn("pa:ss", out)
         self.assertIn("<redacted>", out)
 
+    # ---- F2b: a webhook URL hides its credential in the path ----
+
+    def test_f2b_slack_webhook_token_masked(self):
+        out = hook.redact_command(
+            # Short segments on purpose: a realistically shaped webhook is caught by
+            # GitHub push protection even as a test fixture.
+            "curl -X POST https://hooks.slack.com/services/T0/B0/TOKEN123 -d msg")
+        self.assertNotIn("TOKEN123", out)                     # the posting credential
+        self.assertIn("https://hooks.slack.com/services/", out)   # where, still visible
+        self.assertIn("<redacted>", out)
+
+    def test_f2b_discord_webhook_token_masked(self):
+        out = hook.redact_command(
+            "curl https://discord.com/api/webhooks/123456789/AbCdEfGhIjKlMnOpQrStUvWxYz")
+        self.assertNotIn("AbCdEfGhIjKlMnOpQrStUvWxYz", out)
+        self.assertIn("https://discord.com/api/webhooks/", out)
+
+    def test_f2b_webhook_without_scheme_or_with_port_masked(self):
+        # The same URL shows up scheme-less in logs, as http://, and with an explicit :443.
+        for text in ("posted to hooks.slack.com/services/T0/B0/XXXXXXXXXXXX",
+                     "curl http://hooks.slack.com/services/T0/B0/XXXXXXXXXXXX",
+                     "curl https://hooks.slack.com:443/services/T0/B0/XXXXXXXXXXXX"):
+            out = hook.redact_command(text)
+            self.assertNotIn("XXXXXXXXXXXX", out, text)
+            self.assertIn("<redacted>", out, text)
+
+    def test_f2b_webhook_prefix_alone_not_masked(self):
+        # Nothing after the prefix is not a credential; masking it would be noise.
+        plain = "docs: https://hooks.slack.com/services/"
+        self.assertEqual(hook.redact_command(plain), plain)
+
+    def test_f2b_ordinary_url_untouched(self):
+        out = hook.redact_command("curl https://api.github.com/repos/o/r/issues")
+        self.assertEqual(out, "curl https://api.github.com/repos/o/r/issues")
+
     # ---- F3 (HIGH): complete the R4 fix -- a concurrent Bash never claims ----
 
     def test_f3_concurrent_bash_write_interleave(self):

@@ -292,6 +292,13 @@ QUOTED_KEY_SECRET_RE = re.compile(
 # stay outside the mask; one greedy group + an anchored tail stays linear (no ReDoS).
 URL_CRED_RE = re.compile(
     r"(?i)([a-z][a-z0-9+.\-]{0,15}://[^/\s:@]*:)([^/\s]+)(@[^/\s@:]+)")
+# Webhook URLs carry the credential in the PATH, so none of the key=value / user:pass /
+# Authorization rules can see them -- yet anyone holding the URL can post as you. Keep the
+# host and the fixed prefix (the audit still shows WHERE the agent posted) and mask the rest.
+WEBHOOK_URL_RE = re.compile(
+    r"(?i)(\b(?:hooks\.slack\.com(?::\d+)?/services|discord(?:app)?\.com(?::\d+)?/api/webhooks|"
+    r"outlook\.office(?:365)?\.com(?::\d+)?/webhook|chat\.googleapis\.com(?::\d+)?/v1/spaces)/)"
+    r'[^\s"\'<>|;&]+')
 # --password VALUE / --token=VALUE long flags (group 1 = flag+delim, kept).
 # --password VALUE / --token=VALUE. The delimiter is (?:=\s*|\s+) so MULTIPLE spaces
 # between the flag and the value (`--password   hunter2`) are consumed -- the old
@@ -892,6 +899,7 @@ def _apply_secret_subs(text: str, prose: bool = False) -> str:
     out = QUOTED_KEY_SECRET_RE.sub(lambda m: _kv_sub(m, prose), out)
     out = KV_SECRET_RE.sub(lambda m: _kv_sub(m, prose), out)
     out = URL_CRED_RE.sub(lambda m: m.group(1) + "<redacted>" + m.group(3), out)
+    out = WEBHOOK_URL_RE.sub(lambda m: m.group(1) + "<redacted>", out)
     out = FLAG_SECRET_RE.sub(lambda m: m.group(1) + "<redacted>", out)
     out = (BEARER_STRICT_RE if prose else BEARER_LOOSE_RE).sub("<redacted>", out)
     for rx in TOKEN_SHAPE_RES:
